@@ -26519,6 +26519,8 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 
 					cleanupFailures := false
 					fieldsChanged := false
+					approvedDecision := false
+					deniedDecision := false
 
 					lastIndex := -1
 					decisionIndex := -1
@@ -26543,9 +26545,29 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 
 						mappedArgument := map[string]string{}
 						err = json.Unmarshal([]byte(execArg), &mappedArgument)
-						if err != nil {
-							log.Printf("[ERROR][%s] Failed unmarshalling execution argument during agentic decision handling: %s", execArg, err)
-							break
+						if err != nil || len(mappedArgument) == 0 {
+							// The /forms page sends answer=true|false plus a plain-text (or empty) note instead of a JSON object
+							mappedArgument = map[string]string{}
+							answerValue := request.URL.Query().Get("answer")
+							if decision.ApprovalRequired && decision.RunDetails.Status == "WAITING" && (answerValue == "true" || answerValue == "false") {
+								mappedArgument["approve"] = answerValue
+							} else if len(strings.TrimSpace(execArg)) > 0 {
+								if findContinue {
+									mappedArgument["continue"] = execArg
+								} else {
+									for fieldIndex, field := range decision.Fields {
+										if field.Key == "question" {
+											mappedArgument[fmt.Sprintf("question_%d", fieldIndex)] = execArg
+											break
+										}
+									}
+								}
+							}
+
+							if len(mappedArgument) == 0 {
+								log.Printf("[ERROR][%s] No usable answer for decision '%s' during agentic decision handling. Arg: %#v", oldExecution.ExecutionId, decisionId, execArg)
+								break
+							}
 						}
 
 						handledNumber := []string{}
@@ -26558,21 +26580,25 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 								if value == "true" {
 									unmarshalledDecision.Status = "RUNNING"
 
+									// Restart the timeout clock from the approval, not from when it started waiting
 									decision.RunDetails.Status = "RUNNING"
+									decision.RunDetails.StartedAt = time.Now().UnixMilli()
 									decision.Fields = append(decision.Fields, Valuereplace{
 										Key:   "approve",
 										Value: fmt.Sprintf("Approved to continue at %s", time.Now().Format(time.RFC1123)),
 									})
 
+									approvedDecision = true
 									fieldsChanged = true
 									cleanupFailures = true
 								} else if value == "false" {
 									decision.RunDetails.Status = "FINISHED"
 									decision.Fields = append(decision.Fields, Valuereplace{
 										Key:   "approve",
-										Value: fmt.Sprintf("Approval DENIED at %d. Should stop the agent.", time.Now().Unix()),
+										Value: fmt.Sprintf("Approval DENIED at %s. The agent was stopped.", time.Now().Format(time.RFC1123)),
 									})
 
+									deniedDecision = true
 									fieldsChanged = true
 									cleanupFailures = true
 								} else {
@@ -26701,18 +26727,31 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 					}
 
 					if fieldsChanged && decisionIndex >= 0 {
-						selectedDecision.RunDetails.Status = "FINISHED"
-						selectedDecision.RunDetails.CompletedAt = time.Now().UnixMilli()
+						// An approved decision still has to run, so it stays RUNNING
+						if !approvedDecision {
+							selectedDecision.RunDetails.Status = "FINISHED"
+							selectedDecision.RunDetails.CompletedAt = time.Now().UnixMilli()
+						}
+
 						unmarshalledDecision.Decisions[decisionIndex] = selectedDecision
 
 						// Updates cache live
 						decisionId := fmt.Sprintf("agent-%s-%s", oldExecution.ExecutionId, selectedDecision.RunDetails.Id)
-						marshalledDecision, err := json.Marshal(selectedDecision)
-						if err != nil {
-							log.Printf("[ERROR][%s] Failed marshalling decision during agentic decision handling: %s", oldExecution.ExecutionId, err)
+						if approvedDecision {
+							// RunAgentDecisionAction skips decisions whose cached copy has already started, and writes its own
+							DeleteCache(ctx, decisionId)
 						} else {
-							SetCache(ctx, decisionId, marshalledDecision, 600)
+							marshalledDecision, err := json.Marshal(selectedDecision)
+							if err != nil {
+								log.Printf("[ERROR][%s] Failed marshalling decision during agentic decision handling: %s", oldExecution.ExecutionId, err)
+							} else {
+								SetCache(ctx, decisionId, marshalledDecision, 600)
+							}
 						}
+					}
+
+					if deniedDecision {
+						unmarshalledDecision.Status = "ABORTED"
 					}
 
 					// Cleans them up to be "IGNORED" instead
@@ -26770,7 +26809,21 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 					if marshalledExec, execMarshalErr := json.Marshal(*oldExecution); execMarshalErr == nil {
 						SetCache(ctx, executionCacheKey, marshalledExec, 600)
 					}
+
+					if deniedDecision {
+						// Stops the agent run. abortAgentExecution saves synchronously, so no async save here that could land after it.
+						reason := fmt.Sprintf("Approval denied for '%s' (%s). The agent was stopped.", selectedDecision.Action, selectedDecision.Tool)
+						abortAgentExecution(ctx, *oldExecution, result.Action, "approval_denied", reason, true)
+						return *oldExecution, ExecInfo{}, fmt.Sprintf("Agentic approval denied (%s)", oldExecution.ExecutionId), errors.New("User Input: Agentic approval denied. Agent stopped.")
+					}
+
 					go SetWorkflowExecution(ctx, *oldExecution, true)
+
+					if approvedDecision {
+						// Runs the approved action. Its result comes back through /api/v1/streams like any other decision.
+						go RunAgentDecisionAction(*oldExecution, unmarshalledDecision, selectedDecision)
+						return *oldExecution, ExecInfo{}, fmt.Sprintf("Agentic approval handled (%s)", oldExecution.ExecutionId), errors.New("User Input: Agentic approval handled. Running approved action.")
+					}
 
 					// FIXME: Can we force continue the agent from here? Or do we send another action inbetween?
 					result.Status = fmt.Sprintf("%s_%s", "FINISHED", decisionId)

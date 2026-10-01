@@ -10919,9 +10919,18 @@ data_filter:
 
 			agentOutput.Decisions[decisionIndex] = decision
 
+			// Already approved decisions carry an "approve" field (set in the User Input handler) and must not be gated again
+			alreadyApproved := false
+			for _, field := range decision.Fields {
+				if field.Key == "approve" {
+					alreadyApproved = true
+					break
+				}
+			}
+
 			// Handles approvals
-			if decision.ApprovalRequired && decision.Action != "ask" && decision.Action != "question" && (decision.Category == "singul" || decision.Category == "standalone") && (decision.RunDetails.Status == "" || decision.RunDetails.Status == "RUNNING") {
-				log.Printf("[DEBUG] Decision %d requires approval. SHOULD mark as waiting for approval (not implemented)...", decision.I)
+			if decision.ApprovalRequired && !alreadyApproved && decision.Action != "ask" && decision.Action != "question" && (decision.Category == "singul" || decision.Category == "standalone") && (decision.RunDetails.Status == "" || decision.RunDetails.Status == "RUNNING") {
+				log.Printf("[INFO][%s] AI Agent: Decision %d (%s/%s) requires approval. Waiting for user.", execution.ExecutionId, decision.I, decision.Tool, decision.Action)
 
 				if agentOutput.Decisions[decisionIndex].RunDetails.StartedAt == 0 {
 
@@ -10931,7 +10940,7 @@ data_filter:
 						ctx,
 						fmt.Sprintf("Agent - approval required for '%s'", mappedDecision.Tool),
 						fmt.Sprintf("Approval required during agent run."),
-						fmt.Sprintf("/forms/%s?authorization=%s&reference_execution=%s&source_node=%s&decision_id=%s&backend_url=%s", execution.WorkflowId, execution.Authorization, execution.ExecutionId, startNode.ID, mappedDecision.RunDetails.Id, backendUrl),
+						fmt.Sprintf("/forms/%s?authorization=%s&reference_execution=%s&source_node=%s&decision_id=%s&backend_url=%s", execution.WorkflowId, url.QueryEscape(execution.Authorization), execution.ExecutionId, startNode.ID, mappedDecision.RunDetails.Id, url.QueryEscape(backendUrl)),
 						execution.ExecutionOrg,
 						false,
 						"MEDIUM",
@@ -10949,6 +10958,10 @@ data_filter:
 				decision.RunDetails.Status = "WAITING"
 
 				agentOutput.Decisions[decisionIndex] = decision
+				agentOutput.Status = "WAITING"
+
+				// Pausing for approval is handled, not "nothing ran" - otherwise the agent aborts below
+				decisionActionRan = true
 				continue
 			}
 
