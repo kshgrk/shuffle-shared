@@ -22172,7 +22172,7 @@ func HandleKeyDecryption(data []byte, passphrase string) ([]byte, error) {
 	next := os.Getenv("SHUFFLE_ENCRYPTION_MODIFIER_ROLLOVER")
 
 	decryptWith := []string{}
-	for _, modifier := range []string{next, primary} {
+	for _, modifier := range []string{primary, next} {
 		if len(modifier) == 0 || ArrayContains(decryptWith, modifier) {
 			continue
 		}
@@ -22181,6 +22181,14 @@ func HandleKeyDecryption(data []byte, passphrase string) ([]byte, error) {
 
 	if len(decryptWith) == 0 {
 		return []byte{}, errors.New("HandleKeyDecryption: No encryption modifier set. Define env SHUFFLE_ENCRYPTION_MODIFIER to some random string and NEVER change it to start using encrypted auth.")
+	}
+
+	if primary == "" {
+		log.Printf("[WARNING] Encryption modifier is not set or rotation is not set. This means that the encryption key is not set and auth values are not encrypted. This is a security risk.")
+	}
+
+	if next == "" {
+		log.Printf("[WARNING] Encryption modifier rollover is not set. This means that the encryption key is not rotated and auth values are not encrypted with a new key. This is a security risk.")
 	}
 
 	if debug {
@@ -22195,9 +22203,9 @@ func HandleKeyDecryption(data []byte, passphrase string) ([]byte, error) {
 		if err == nil {
 			if debug {
 				if i == 0 {
-					log.Printf("[DEBUG] Decrypted value with the current (newest) key [%d/%d]", i+1, len(decryptWith))
+					log.Printf("[DEBUG] Decrypted value with the current (older) key [%d/%d]", i+1, len(decryptWith))
 				} else {
-					log.Printf("[DEBUG] Decrypted value with an older key [%d/%d] - value not yet moved to the current key", i+1, len(decryptWith))
+					log.Printf("[DEBUG] Decrypted value with an new key [%d/%d] - value not yet moved to the current key", i+1, len(decryptWith))
 				}
 			}
 
@@ -28975,7 +28983,7 @@ func GetAuthentication(ctx context.Context, workflowExecution WorkflowExecution,
 
 				newAuth, err := RunOauth2Request(ctx, user, curAuth, true)
 				if err != nil {
-					log.Printf("[ERROR] Failed running oauth request to refresh oauth2 tokens (1): '%s'. Stopping Oauth2 continuation and sending abort for app. This is NOT critical, but means refreshing access_token failed, and it will stop working in the future.", err)
+					log.Printf("[ERROR][%s] Failed running oauth request to refresh oauth2 tokens (1): '%s'. Stopping Oauth2 continuation and sending abort for app. This is NOT critical, but means refreshing access_token failed, and it will stop working in the future.", workflowExecution.ExecutionId, err)
 
 					go CreateOrgNotification(
 						ctx,
