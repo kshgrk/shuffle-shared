@@ -6991,8 +6991,8 @@ func SetNewWorkflow(resp http.ResponseWriter, request *http.Request) {
 	body, err := ioutil.ReadAll(request.Body)
 	if err != nil {
 		log.Printf("Error with body read: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false}`))
+		resp.WriteHeader(400)
+		resp.Write([]byte(`{"success": false, "reason": "Failed reading the request body"}`))
 		return
 	}
 
@@ -7000,8 +7000,8 @@ func SetNewWorkflow(resp http.ResponseWriter, request *http.Request) {
 	err = json.Unmarshal(body, &workflow)
 	if err != nil {
 		log.Printf("Failed unmarshaling: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false}`))
+		resp.WriteHeader(400)
+		resp.Write([]byte(`{"success": false, "reason": "The body must be workflow JSON, e.g. {\"name\": \"...\", \"description\": \"...\"}"}`))
 		return
 	}
 
@@ -38487,19 +38487,44 @@ func GetWorkflowAppActions(resp http.ResponseWriter, request *http.Request) {
 		log.Printf("[WARNING] Failed loading org auths in GetWorkflowAppActions: %s", authErr)
 	}
 
+	// Same name rule as the frontend: case, spaces, hyphens and underscores don't matter ("Google Sheets" == "google_sheets")
+	sameAppName := func(a, b string) bool {
+		norm := func(s string) string {
+			return strings.NewReplacer(" ", "_", "-", "_").Replace(strings.ToLower(strings.TrimSpace(s)))
+		}
+		return len(a) > 0 && norm(a) == norm(b)
+	}
+
 	for i := range responses {
 		app := matchedById[responses[i].AppID]
 		responses[i].Activated = orgApps[app.ID]
 		responses[i].AuthenticationRequired = app.Authentication.Required
 
+		// auth_status tells the agent exactly what is known, so it never reports missing auth when it can't tell:
+		// authenticated, failing (saved but the last check failed), missing, or unknown (the auth list didn't load)
+		failing := false
 		for _, auth := range orgAuths {
-			if auth.App.ID == app.ID || strings.EqualFold(auth.App.Name, app.Name) {
-				responses[i].Authenticated = true
-				break
+			if auth.App.ID != app.ID && !sameAppName(auth.App.Name, app.Name) {
+				continue
 			}
+			if auth.Validation.ValidationRan && !auth.Validation.Valid {
+				failing = true
+				continue
+			}
+			responses[i].Authenticated = true
+			break
 		}
 
-		if responses[i].AuthenticationRequired && !responses[i].Authenticated && authErr == nil {
+		switch {
+		case authErr != nil:
+			responses[i].AuthStatus = "unknown"
+		case responses[i].Authenticated:
+			responses[i].AuthStatus = "authenticated"
+		case failing:
+			responses[i].AuthStatus = "failing"
+			responses[i].SetupUrl = fmt.Sprintf("/apps/%s", app.ID)
+		case responses[i].AuthenticationRequired:
+			responses[i].AuthStatus = "missing"
 			responses[i].SetupUrl = fmt.Sprintf("/apps/%s", app.ID)
 		}
 	}
@@ -39138,8 +39163,10 @@ func buildInternalAppRequest(path, method string, operation *openapi3.Operation,
 	}
 
 	body := fields["body"]
-	if len(body) == 0 {
+	if len(body) == 0 && normalizeToolName(specActionName(method, operation.Summary)) == "postgetappactionssummary" {
 		body = getAppLookupBody(fields)
+	} else if len(body) == 0 && !strings.EqualFold(method, "GET") {
+		body = getLooseFieldsBody(operation, fields)
 	}
 
 	if len(query) > 0 {
@@ -39151,6 +39178,56 @@ func buildInternalAppRequest(path, method string, operation *openapi3.Operation,
 		Path:   path,
 		Body:   []byte(body),
 	}, true
+}
+
+// The model sometimes sends body keys as their own fields, e.g. name + description for create workflow.
+// Without this the handler got an empty body and failed parsing it.
+func getLooseFieldsBody(operation *openapi3.Operation, fields map[string]string) string {
+	skip := map[string]bool{"body": true}
+	for _, ref := range operation.Parameters {
+		if ref != nil && ref.Value != nil {
+			skip[normalizeToolName(ref.Value.Name)] = true
+			skip[normalizeToolName(ValidateParameterName(ref.Value.Name))] = true
+		}
+	}
+
+	// Fields arrive normalized (workflowid), so the schema gives back the real key (workflow_id)
+	names := map[string]string{}
+	if operation.RequestBody != nil && operation.RequestBody.Value != nil {
+		if media := operation.RequestBody.Value.Content.Get("application/json"); media != nil && media.Schema != nil && media.Schema.Value != nil {
+			for name := range media.Schema.Value.Properties {
+				names[normalizeToolName(name)] = name
+			}
+		}
+	}
+
+	body := map[string]interface{}{}
+	for key, value := range fields {
+		value = strings.TrimSpace(value)
+		if skip[key] || len(value) == 0 {
+			continue
+		}
+
+		name := key
+		if real, ok := names[key]; ok {
+			name = real
+		}
+
+		// Nested objects and lists stay structured, everything else is a string
+		var parsed interface{}
+		if (strings.HasPrefix(value, "{") || strings.HasPrefix(value, "[")) && json.Unmarshal([]byte(value), &parsed) == nil {
+			body[name] = parsed
+		} else {
+			body[name] = value
+		}
+	}
+
+	if len(body) == 0 {
+		return ""
+	}
+
+	result, _ := json.Marshal(body)
+	return string(result)
 }
 
 // The model sometimes sends app_names as its own field instead of inside body

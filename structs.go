@@ -6328,6 +6328,7 @@ type AppActionResponse struct {
 	AuthenticationRequired bool   `json:"authentication_required,omitempty"`
 	Authenticated          bool   `json:"authenticated,omitempty"`
 	SetupUrl               string `json:"setup_url,omitempty"`
+	AuthStatus             string `json:"auth_status,omitempty"` // authenticated, failing, missing, unknown; empty when the app needs no auth
 }
 
 // WorkflowOperation represents a single modification operation
