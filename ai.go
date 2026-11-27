@@ -1,6 +1,10 @@
 package shuffle
 
 import (
+	"embed"
+	"io/fs"
+	pathpkg "path"
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -30,6 +34,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	yamlv3 "gopkg.in/yaml.v3"
 	"time"
 	"unicode/utf8"
 
@@ -1870,6 +1876,21 @@ func extractDecisionJSONL(rawText string) ([]AgentDecision, error) {
 	return collectedDecisions, nil
 }
 
+// Only the approve handler may add the "approve" field. A model can copy an earlier approved step's
+// field into a new step, which would otherwise make that step look approved and skip the user.
+func stripModelApprovals(decisions []AgentDecision) []AgentDecision {
+	for i := range decisions {
+		fields := decisions[i].Fields[:0]
+		for _, field := range decisions[i].Fields {
+			if field.Key != "approve" {
+				fields = append(fields, field)
+			}
+		}
+		decisions[i].Fields = fields
+	}
+	return decisions
+}
+
 // parseAgentDecisions extracts AgentDecision structs from messy LLM output. It tries multiple strategies in order: JSON array, JSONL, then array after unescaping.
 func parseAgentDecisions(rawOutput string) ([]AgentDecision, error) {
 	cleanedText := FixContentOutput(rawOutput)
@@ -1879,20 +1900,20 @@ func parseAgentDecisions(rawOutput string) ([]AgentDecision, error) {
 	//Try to parse as a JSON array
 	parsedDecisions, extractionErr := extractDecisionArray(cleanedText)
 	if extractionErr == nil {
-		return parsedDecisions, nil
+		return stripModelApprovals(parsedDecisions), nil
 	}
 
 	// Try to parse as JSONL (one object per occurrence)
 	parsedDecisions, extractionErr = extractDecisionJSONL(cleanedText)
 	if extractionErr == nil {
-		return parsedDecisions, nil
+		return stripModelApprovals(parsedDecisions), nil
 	}
 
 	// unescape quotes, then retry the array strategy
 	unescapedText := strings.ReplaceAll(cleanedText, `\"`, `"`)
 	parsedDecisions, extractionErr = extractDecisionArray(unescapedText)
 	if extractionErr == nil {
-		return parsedDecisions, nil
+		return stripModelApprovals(parsedDecisions), nil
 	}
 
 	return nil, fmt.Errorf("failed to parse agent decisions from LLM output")
@@ -7764,6 +7785,105 @@ func findExplicitTotal(v interface{}, depth int) (interface{}, bool) {
 	return nil, false
 }
 
+// ---- Agent history size ----
+// Every past decision goes back to the model on every turn, so one 200k-character API response
+// is paid for on every later turn. The prompt copy keeps the structure (all keys, the first list
+// items, the start of long strings) within a budget; the stored decision keeps the full output.
+// ponytail: fixed budgets by age, tune agentHistoryRecent* if the model needs more of old results
+const (
+	agentHistoryRecentSteps  = 3
+	agentHistoryRecentBudget = 6000
+	agentHistoryOlderBudget  = 1200
+	agentHistoryFieldBudget  = 2000
+)
+
+func shrinkAgentHistoryDecisions(decisions []AgentDecision) []AgentDecision {
+	for index := range decisions {
+		decision := &decisions[index]
+		recent := len(decisions)-index <= agentHistoryRecentSteps
+		// Skill files are instructions the agent loaded on purpose: keep them whole
+		if normalizeToolName(decision.Action) == "getskillresource" {
+			continue
+		}
+
+		budget := agentHistoryOlderBudget
+		if recent {
+			budget = agentHistoryRecentBudget
+		}
+		decision.RunDetails.RawResponse = shrinkAgentHistoryText(decision.RunDetails.RawResponse, budget)
+
+		if !recent {
+			// Fields is shared with the stored decision, so shrink a copy
+			fields := make([]Valuereplace, len(decision.Fields))
+			copy(fields, decision.Fields)
+			for fieldIndex := range fields {
+				fields[fieldIndex].Value = shrinkAgentHistoryText(fields[fieldIndex].Value, agentHistoryFieldBudget)
+			}
+			decision.Fields = fields
+		}
+	}
+
+	return decisions
+}
+
+func shrinkAgentHistoryText(text string, budget int) string {
+	if len(text) <= budget {
+		return text
+	}
+
+	shrunk := text
+	if parsed, err := parseDeepJSON([]byte(text)); err == nil {
+		// Halve the kept detail until it fits, so small results keep the most
+		for _, limits := range [][2]int{{400, 10}, {200, 5}, {100, 3}, {60, 2}} {
+			marshalled, err := json.Marshal(shrinkAgentHistoryValue(parsed, limits[0], limits[1], 0))
+			if err != nil {
+				break
+			}
+			shrunk = string(marshalled)
+			if len(shrunk) <= budget {
+				break
+			}
+		}
+	}
+
+	if len(shrunk) > budget {
+		shrunk = string([]rune(shrunk)[:budget])
+	}
+
+	return fmt.Sprintf("%s [shortened for history: %d of %d characters. Run the action again if you need the rest]", shrunk, len(shrunk), len(text))
+}
+
+func shrinkAgentHistoryValue(value interface{}, maxString, maxItems, depth int) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		if depth > 8 {
+			return fmt.Sprintf("{object with %d keys}", len(typed))
+		}
+		out := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			out[key] = shrinkAgentHistoryValue(item, maxString, maxItems, depth+1)
+		}
+		return out
+	case []interface{}:
+		out := []interface{}{}
+		for index, item := range typed {
+			if index == maxItems {
+				out = append(out, fmt.Sprintf("[%d more items]", len(typed)-maxItems))
+				break
+			}
+			out = append(out, shrinkAgentHistoryValue(item, maxString, maxItems, depth+1))
+		}
+		return out
+	case string:
+		if len(typed) <= maxString {
+			return typed
+		}
+		return fmt.Sprintf("%s... [+%d characters]", string([]rune(typed)[:maxString]), len(typed)-maxString)
+	}
+
+	return value
+}
+
 func ReduceAgentResponseData(rawResponse []byte, dataFilter string, fieldsNeeded []string) []byte {
 	if len(rawResponse) == 0 {
 		return rawResponse
@@ -7835,25 +7955,163 @@ func ReduceAgentResponseData(rawResponse []byte, dataFilter string, fieldsNeeded
 	return rawResponse
 }
 
+
+// ---- Agent skills ----
+// Each agent template's instructions live in skills/<name>/SKILL.md (agentskills.io layout), shipped inside the binary.
+// SKILL.md is the template's system rule; files under references/ are loaded on demand with get_skill_resource.
+
+//go:embed skills
+var agentSkillFiles embed.FS
+
+type agentSkill struct {
+	Name        string
+	Description string
+	Templates   []string
+	Body        string
+	Resources   []string
+}
+
+var (
+	agentSkillsOnce sync.Once
+	agentSkills     map[string]agentSkill
+)
+
+func loadAgentSkills() map[string]agentSkill {
+	agentSkillsOnce.Do(func() {
+		agentSkills = map[string]agentSkill{}
+		entries, err := fs.ReadDir(agentSkillFiles, "skills")
+		if err != nil {
+			log.Printf("[ERROR] Failed reading embedded agent skills: %s", err)
+			return
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+
+			skill, err := parseAgentSkill(entry.Name())
+			if err != nil {
+				log.Printf("[ERROR] Failed loading agent skill %s: %s", entry.Name(), err)
+				continue
+			}
+
+			agentSkills[skill.Name] = skill
+		}
+	})
+
+	return agentSkills
+}
+
+func parseAgentSkill(dir string) (agentSkill, error) {
+	raw, err := agentSkillFiles.ReadFile(pathpkg.Join("skills", dir, "SKILL.md"))
+	if err != nil {
+		return agentSkill{}, err
+	}
+
+	parts := strings.SplitN(string(raw), "---\n", 3)
+	if len(parts) != 3 || len(strings.TrimSpace(parts[0])) > 0 {
+		return agentSkill{}, errors.New("SKILL.md must start with --- frontmatter")
+	}
+
+	frontmatter := struct {
+		Name        string            `yaml:"name"`
+		Description string            `yaml:"description"`
+		Metadata    map[string]string `yaml:"metadata"`
+	}{}
+	if err := yamlv3.Unmarshal([]byte(parts[1]), &frontmatter); err != nil {
+		return agentSkill{}, err
+	}
+
+	if frontmatter.Name != dir || len(frontmatter.Description) == 0 {
+		return agentSkill{}, fmt.Errorf("name must equal the folder (%s) and description must be set", dir)
+	}
+
+	skill := agentSkill{
+		Name:        frontmatter.Name,
+		Description: frontmatter.Description,
+		Templates:   strings.Fields(strings.ToLower(frontmatter.Metadata["templates"])),
+		Body:        strings.TrimSpace(parts[2]),
+	}
+
+	fs.WalkDir(agentSkillFiles, pathpkg.Join("skills", dir, "references"), func(filePath string, entry fs.DirEntry, err error) error {
+		if err == nil && !entry.IsDir() {
+			skill.Resources = append(skill.Resources, strings.TrimPrefix(filePath, pathpkg.Join("skills", dir)+"/"))
+		}
+		return nil
+	})
+
+	return skill, nil
+}
+
+// Template names are aliases, e.g. edit-workflow and build-workflows both use the workflow-builder skill
+func agentSkillForTemplate(template string) (agentSkill, bool) {
+	template = strings.ToLower(strings.TrimSpace(template))
+	if len(template) == 0 {
+		return agentSkill{}, false
+	}
+
+	for _, skill := range loadAgentSkills() {
+		if skill.Name == template {
+			return skill, true
+		}
+		for _, alias := range skill.Templates {
+			if alias == template {
+				return skill, true
+			}
+		}
+	}
+
+	return agentSkill{}, false
+}
+
+func agentSkillBody(name string) string {
+	skill, ok := loadAgentSkills()[name]
+	if !ok {
+		log.Printf("[ERROR] Agent skill %s is missing from the binary", name)
+	}
+	return skill.Body
+}
+
+// Only files the skill ships are served, so path can't walk out of the skill folder
+func readAgentSkillResource(name, resourcePath string) (string, error) {
+	skill, ok := loadAgentSkills()[strings.ToLower(strings.TrimSpace(name))]
+	if !ok {
+		return "", fmt.Errorf("no skill named '%s'", name)
+	}
+
+	resourcePath = strings.TrimPrefix(pathpkg.Clean("/"+strings.TrimSpace(resourcePath)), "/")
+	for _, resource := range skill.Resources {
+		if resource == resourcePath {
+			data, err := agentSkillFiles.ReadFile(pathpkg.Join("skills", skill.Name, resource))
+			return string(data), err
+		}
+	}
+
+	return "", fmt.Errorf("skill '%s' has no file '%s'. Files: %s", skill.Name, resourcePath, strings.Join(skill.Resources, ", "))
+}
+
 // createNextActions = false => start of agent to find initial decisions
 // createNextActions = true => mid-agent to decide next steps
 func getTemplateContext(ctx context.Context, template string, execution WorkflowExecution) (string, string, []string, error) {
-	// FIXME: Handle dynamic templates here too, based on user input
-
-	if isWorkflowBuilderTemplate(template) {
-		return buildWorkflowEditContext(ctx, execution)
-	}
-
-	switch template {
-	case "computer-use", "host-monitor-control":
-		return buildComputerUseContext(ctx, execution)
-	case "incident-response", "incident-handler":
-		return buildIncidentHandlerContext(ctx, execution)
-	case "vulnerability", "vulnerability-management", "vulnerability-agent":
-		return buildVulnerabilityManagementContext(ctx, execution)
-	default:
+	skill, ok := agentSkillForTemplate(template)
+	if !ok {
 		return "", "", []string{}, nil
 	}
+
+	// Skills that need live data (app summaries, the incident record...) build it here
+	switch skill.Name {
+	case "workflow-builder":
+		return buildWorkflowEditContext(ctx, execution)
+	case "computer-use":
+		return buildComputerUseContext(ctx, execution)
+	case "incident-handler":
+		return buildIncidentHandlerContext(ctx, execution)
+	case "vulnerability-management":
+		return buildVulnerabilityManagementContext(ctx, execution)
+	}
+
+	return skill.Body, "", []string{}, nil
 }
 
 // Control a computer (Computer-Use)
@@ -8080,52 +8338,7 @@ func buildComputerUseContext(ctx context.Context, execution WorkflowExecution) (
 	// Question: Can this be done in a "specialised" fashion as well?
 	// AKA: not a generalised computer agent, but one built for a specific usecase
 
-	systemRule := `# ROLE & CAPABILITIES
-You are an autonomous Computer-Using Agent interacting with a desktop/browser environment. You interact with the system by taking screenshots, parsing UI elements, and emitting action tool calls. Make assumptions for what they most likely want to perform, and continue until it is done. 
-
-# RULES & RESPONSIBILITIES
-- For terminal commands, always assume they do not exist by testing them first. If running bash scripts, always validate the output. STDOUT is captured.
-- Prefer direct osctrl / Computer-Use actions when available (` + "`execute_command`" + `, ` + "`list_files`" + `, ` + "`find_files`" + `, ` + "`read_file`" + `, ` + "`edit_file`" + `, ` + "`write_file`" + `, ` + "`create_file`" + `, ` + "`create_directory`" + `, ` + "`search_files`" + `, ` + "`list_processes`" + `, ` + "`list_installed_software`" + `, ` + "`take_screenshot`" + `, ` + "`inspect_ui`" + `, ` + "`remote_control`" + `).
-- Use the 'post_control_mouse_and_keyboard' function for keyboard & mouse control if it is available. You can chain together escaped JSON commands in the the "actions" array using the operations detailed below. 
-- If an action produces no state change in the new screenshot, do NOT repeat the exact same action. Try an alternative input method (e.g., press Enter instead of clicking 'Search', or scroll to reveal hidden UI elements).
-- When an action takes more than 30 seconds, it will return an execution_id and authorization key to be used for polling results. When polling, always add 30 second or more delay. 
-- Ask for input IF: MFA challenges, CAPTCHAs, credit card payments, performing destrucive actions, 
-
-# OPERATION OVERVIEW 
-1. keyboard.type: {"keys":"https://google.com"}
-2. keyboard.hotkey: {"keys":"control,tab"}
-3. mouse.click: {"x":600,"y":400,"button":"left","delay_ms":100}
-4. Mouse move:  {"x":600,"y":400}
-5. mouse.drag:  {"from_x":600,"from_y":400,"to_x":800,"to_y":500,"button":"left"}
-6. system.wait: {"ms":250}
-
-When sending body to the post_control_mouse_and_keyboard function, the following body structure should be used:
-'''
-{
-  "app_id": "sensors",
-  "app_name": "sensors",
-  "name": "run_action",
-  "parameters": [
-	{ "name": "action", "value": "script:remote_control {\"actions\":[{\"op\":\"{operation}\",\"params\": {params}}]}"},
-	{ "name": "hosts", "value": "${hostname}" },
-	{ "name": "host_group", "value": "${host_group_optional}" }
-  ]
-}
-'''
-
-# HOST CHOICE
-When choosing one or more hostnames, NEVER guess which host. When available, ALWAYS use one that recently checked in or is active. 
-
-
-# CRITICAL EXECUTION RULES
-- COORDINATES: All coordinates must be specified relative to the current image width and height. Always click in the center of clickable elements.
-- ONE ACTION AT A TIME: Perform a MAXIMUM of THREE keyboard- or ONE mouse operation in a single decision. 
-- STAGNATION PROTOCOL: If the screenshot does not change after an action:
-  1. Do not repeat the action.
-  2. Attempt to scroll or use keyboard navigation (e.g., press 'Tab' or 'Enter').
-  3. If stuck for >3 turns on the same screen, set approval_required: true 
-- ACCESSIBILITY & POP-UPS: Always resolve overlays, cookie banners, or modal dialogs before trying to interact with background content.
-`
+	systemRule := agentSkillBody("computer-use")
 
 	templateContext := ""
 	orgId := strings.TrimSpace(execution.ExecutionOrg)
@@ -8170,270 +8383,7 @@ func buildWorkflowEditContext(ctx context.Context, execution WorkflowExecution) 
 You MUST use this exact workflow_id in every single put_agent_update operation. DO NOT try to guess or create a new one.`, targetWorkflowId)
 	}
 
-	systemRule := `[SECONDARY]: You are an autonomous workflow-building agent. You build or edit workflows that will eventually automate the task. Only use the special actions built for you — put_agent_update is the primary one you will use. If the user requests an integration that is not in Available Apps, it can still be used: call post_get_app_actions_summary on the shuffle_apps tool with body {"app_names": ["<app name>"]} BEFORE anything else. It searches every public app and returns its app_id and actions. Never ask the user for an app ID, and never replace a requested app with an HTTP node when the lookup finds it. Only if the lookup finds nothing, tell the user the app wasn't found.
-
-The lookup also says what the user has to do:
-- "setup_url" present: the app needs credentials the user hasn't added. Build the node anyway with the returned app_id (adding it activates the app). Then use the ask action with a markdown link, e.g. "Google Sheets needs to be authenticated before this workflow can run. [Authenticate Google Sheets](<setup_url>), then reply **done**." Ask once for all such apps together. When the user replies, call the lookup again; once "authenticated" is true, run put_agent_update with "operations": [{"op": "save_workflow"}] so the credentials are attached to the node. If it is still not authenticated, finish and tell the user the node will need credentials before it runs.
-- no "setup_url": the app is ready, just build with it.
-
-The user sees the "reason" of every decision as progress while you work, so write it as one short, plain sentence about what you are doing and why (e.g. "Looking up Google Sheets to find its append action"). No JSON or IDs in it. When you ask the user something, keep the question short; if there are a few clear options, put them as a numbered list. Your finish output should briefly list what you changed.
-
-Only ask the user for information when it is genuinely unavailable through any allowed action. Use get_minimal_workflow to fetch the latest workflow state whenever you need to inspect or verify what is currently in the workflow — prefer this over relying on stale context.
-
-Runs and checks:
-- When the user says a run failed, didn't work, or asks you to check it, call get_workflow_run FIRST (execution_id latest_failed) and base your fix on its real errors and "references". Don't guess. Use get_workflow_runs to find a specific run.
-- To see or undo changes, use get_workflow_revisions, post_compare_workflow and post_revert_workflow. Before reverting the whole workflow, ask the user unless they asked for it; then call it with confirm=true.
-- These workflow tools return "next". When unsure what to do, follow it.
-- Errors inside a run (HTTP 401/403, invalid tokens, credentials) are the workflow's errors, not failures of your own tool call: don't stop for them. Credential errors can't be fixed by editing nodes: get the app's setup_url with post_get_app_actions_summary and ask the user to authenticate.
-- A run that started before the workflow was last saved used an older version. Ask the user to re-run before judging your fix.
-- put_agent_update returns "validation". Fix its errors before you tell the user you're done.
-- Your messages and finish output render in a chat that colors two markdown forms, so use them for results the user must notice: a quote starting with [!ERROR], [!WARNING] or [!SUCCESS] on its own line (e.g. "> [!ERROR]" then "> Google Sheets rejected the body: HTTP 400"), and statuses as inline code, wrapped in single backticks (FAILED, SUCCESS, HTTP 400). Use at most one or two callouts per message; plain text for everything else.
-- shuffle_workflows_builder actions run immediately, so never set "delay" on them. After post_run_workflow, check the run with get_workflow_run; if it's still running after one more check, finish and give the user the run ID instead of waiting.
-
-Payload Structure
-
-Send your incremental steps in the operations array. You can send one operation at a time, or multiple if you are building a connected sequence.
-Key is "body" and Value is {
-"workflow_id": "<workflow_id>",
-"operations": [ ...array of step-by-step operations... ]
-}
-
-CRITICAL: The "operations" field MUST be a JSON array of objects. NEVER write a natural language plan, summary, or string inside the "operations" field. This overrides the generic "value": "literal_value" example shown elsewhere in your instructions — for put_agent_update, "value" is ALWAYS an object, and "operations" inside it is ALWAYS an array, never a string.
-
-Concrete example of a correct full decision using put_agent_update:
-{
-  "action": "put_agent_update",
-  "category": "singul",
-  "tool": "put_agent_update",
-  "fields": [
-    {
-      "key": "body",
-      "value": {
-        "workflow_id": "<workflow_id>",
-        "operations": [
-          { "op": "edit_node", "id": "<real_node_id>", "data": { "parameters": [ { "name": "method", "value": "GET" }, { "name": "url", "value": "https://example.com" } ] } }
-        ]
-      }
-    }
-  ]
-}
-  
-INCORRECT (do NOT do this): { "key": "body", "value": { "operations": "Update the workflow actions as follows: ...", "workflow_id": "<workflow_id>" } }
-
-Supported Step-by-Step Operations
-
-A workflow has two types of nodes: Actions and Triggers. If you need a trigger, use Webhook, Schedule, User Input, or Subflow. There is no rigid rule that triggers must always exist — only use a trigger if the workflow solution genuinely needs it.
-
-Format: Webhook Trigger (Incoming HTTP requests)
-{
-"op": "add_node",
-"node_type": "trigger",
-"temp_id": "<your_temp_id>",
-"data": {
-  "app_name": "Webhook",
-  "label": "<unique_node_name>",
-  "x": 100,
-  "y": 100
-}
-}
-
-Format: Schedule Trigger (Time / cron interval triggers)
-{
-"op": "add_node",
-"node_type": "trigger",
-"temp_id": "<your_temp_id>",
-"data": {
-  "app_name": "Schedule",
-  "label": "<unique_node_name>",
-  "parameters": [
-    { "name": "cron", "value": "*/15 * * * *" }
-  ],
-  "x": 100,
-  "y": 100
-}
-}
-
-Format: User Input Trigger (Human-in-the-loop approval / decision checkpoint that pauses execution awaiting manual user approval)
-{
-"op": "add_node",
-"node_type": "trigger",
-"temp_id": "<your_temp_id>",
-"data": {
-  "app_name": "User Input",
-  "label": "<unique_node_name>",
-  "parameters": [
-    { "name": "alertinfo", "value": "## Approve Action?\n\nDetails: $exec" },
-    { "name": "type", "value": "email" },
-    { "name": "email", "value": "admin@example.com" },
-    { "name": "options", "value": "boolean" },
-    { "name": "subflow", "value": "" },
-    { "name": "subflow_failure", "value": "" }
-  ],
-  "x": 100,
-  "y": 100
-}
-}
-Note on User Input parameters:
-- "alertinfo": The prompt/markdown shown to the human.
-- "type": Delivery method: "email", "sms", "subflow", or combinations like "subflow,email".
-- "email": Target email for email notifications.
-- "sms": Target phone number for SMS notifications.
-- "subflow": Optional workflow UUID to trigger for approval handling.
-- "subflow_failure": Optional workflow UUID to trigger if the human clicks Decline.
-- "options": Response type (typically "boolean").
-
-Format: Subflow Trigger (Triggered when this workflow is called as a subflow from another workflow)
-{
-"op": "add_node",
-"node_type": "trigger",
-"temp_id": "<your_temp_id>",
-"data": {
-  "app_name": "Shuffle Workflow",
-  "label": "<unique_node_name>",
-  "parameters": [
-    { "name": "workflow", value: "<the workflow_id>"},
-    { "name": "argument", "value": "$exec" },
-    { "name": "check_result", "value": "true" }
-  ],
-  "x": 100,
-  "y": 100
-}
-}
-
-1. ADDING A NODE (Action)
-{
-"op": "add_node",
-"node_type": "action",
-"temp_id": "a_temp_id_string",
-"data": {
-  "app_id": "<id of the app>",
-  "action_name": "<name of action to use, or custom_action>",
-  "label": "Authenticate User",
-  "parameters": [
-    { "name": "param_1", "value": "some_value" }
-  ],
-  "x": 0,
-  "y": 0
-}
-}
-
-POSITIONING (x/y): get_minimal_workflow returns the real x/y of every existing node — use it. The overall flow should progress left to right: a node's "x" should generally be greater than the node(s) before it in the sequence (e.g. roughly halfway between two neighbors' x values if inserting between them, or ~337 to the right of the last node if appending). "y" should match its predecessor UNLESS this node is one of several parallel branches running off the same source node — in that case, give each parallel branch its own distinct "y" (spread them apart, e.g. ±150-250) so they fan out and don't overlap, matching how the user's request implies the branches should look. If the user explicitly describes a specific layout or arrangement, follow that instead of these defaults. Only leave "x" and "y" at 0 when you have no neighbor position to go on (e.g. the very first action in a brand-new workflow) — the backend will auto-place it. NEVER reuse the exact same fixed x/y (e.g. 100,100) for multiple unrelated actions, that stacks them directly on top of each other.
-
-Every action’s response is stored under its label. You can reference it using:
-$label_name this itself gives you the parsed JSON output of the action
-* $jira_action_1.id
-* $python_2.message.email
-* For triggers use "$exec" for example $exec.field
-
-Note: You can control WHERE in the sequence a new node is inserted (which also determines its horizontal position) by adding "insert_before": "<node_id>" or "insert_after": "<node_id>" alongside the data field.
-
-2. CONNECTING NODES (Adding a Branch)
-Connect your nodes using their real IDs (if they already exist) or the temp_id you assigned when creating them in the same payload. You can include an array of conditions if you are adding multiple to the same branch.
-{
-"op": "add_branch",
-"temp_id": "branch_1",
-"data": {
-  "source_id": "<real_node_id or temp_id>",
-  "destination_id": "<real_node_id or temp_id>",
-  "conditions": [
-    { "source": "$some_var", "condition": "equals", "destination": "true" }
-  ]
-}
-}
-
-3. EDITING A NODE
-Only provide the fields you actually want to change.
-{
-"op": "edit_node",
-"id": "<real_node_id>",
-"data": {
-  "label": "New Name",
-  "parameters": [
-    { "name": "param_1", "value": "new_value" }
-  ]
-}
-}
-
-To swap a node to another app or action (e.g. an HTTP node to Google Sheets), use edit_node with the new app_id and action_name. The node keeps its id, label, position and branches, and its parameters become those of the new action, so pass the values for them:
-{
-"op": "edit_node",
-"id": "<real_node_id>",
-"data": {
-  "app_id": "<app_id from the app lookup>",
-  "action_name": "<action of that app>",
-  "parameters": [
-    { "name": "<parameter of that action>", "value": "<value>" }
-  ]
-}
-}
-
-4. DELETING OR MOVING
-{ "op": "delete_node", "node_type": "action", "id": "<real_node_id>" }
-{ "op": "delete_branch", "id": "<real_branch_id>" }
-{ "op": "move_node", "id": "<real_node_id>", "data": { "x": 250, "y": 300 } }
-
-5. MANAGING CONDITIONS
-You can add, edit, or delete conditions on an EXISTING branch.
-NOTE: To edit or delete, you must use a Get/Read action first to find the exact condition ID.
-
-Available operators: equals, larger than, less than, does not equal, startswith, endswith, is empty, contains, contains_any_of.
-
-Add conditions to an existing branch:
-{
-"op": "add_condition",
-"branch_id": "<real_branch_id or temp_id>",
-"data": {
-  "conditions": [
-    { "source": "$var", "condition": "equals", "destination": "val" }
-  ]
-}
-}
-
-Edit existing conditions (only include fields you want to change):
-{
-"op": "edit_condition",
-"branch_id": "<real_branch_id>",
-"data": {
-  "conditions": [
-    { "id": "<real_condition_id>", "source": "$new_var", "condition": "contains", "destination": "new_val" }
-  ]
-}
-}
-
-Delete conditions:
-{
-"op": "delete_condition",
-"branch_id": "<real_branch_id>",
-"data": {
-  "condition_ids": ["<real_condition_id>"]
-}
-}
-
-6. SETTING THE START NODE
-Defines the entry point of the workflow. You can use a real ID or a temp_id from the same payload.
-IMPORTANT: The start node must always be an ACTION, never a trigger. If the workflow begins with a trigger, connect it to its first action via add_branch, then pass that action's id (the trigger's destination) here — NOT the trigger's own id.
-{
-"op": "set_start_node",
-"id": "<real_node_id or temp_id>"
-}
-
-7. SAVING THE WORKFLOW
-Your edits are stored as a real-time draft. When you are completely finished building or modifying the workflow, you MUST append this operation to your final payload to permanently save the workflow to the database. Call this only after all changes are complete — do not forget it.
-{
-"op": "save_workflow"
-}
-
-To use data from another node, reference its label.
-
-CRITICAL RULES FOR THE AGENT
-
-1. Handling Errors: If you make a mistake, the API will reject your request and tell you EXACTLY which operation failed and why (e.g., "Operation 1 failed: app_id is required"). Read the error carefully, fix the specific missing or incorrect field, and try again.
-2. Special actions are built exclusively for you. put_agent_update is the core action that does most of the heavy lifting.
-3. Use get_minimal_workflow to fetch the current workflow state only whenever you need it.
-4. Try not to use parallel decision calling; always do sequential tool calls.
-5. Verify before you report: put_agent_update returns the updated workflow. Check that the nodes you changed now have the app, action and parameter values you intended before you tell the user it's done. If they don't, fix it first.
-6. Asking for credentials is not asking for approval. If you need both, ask for the approval separately and wait for an explicit yes.
-7. Report runs as they are: a workflow run is only done when get_workflow_run says FINISHED or ABORTED. Report each node from its own result. If a node has no result yet, say it has not run. If the run is still EXECUTING after a few checks, tell the user it looks stuck and name the node it is waiting on. Never describe a step that has no result as done or in progress.`
+	systemRule := agentSkillBody("workflow-builder")
 
 	templateContext := fmt.Sprintf(`%s
 
@@ -8452,6 +8402,120 @@ CRITICAL RULES FOR THE AGENT
 	}
 
 	return systemRule, templateContext, requiredApps, nil
+}
+
+// ---- Workflow builder: app calls with the user's auth + approval for writes ----
+
+// In builder runs the agent may call real apps (with the user's saved auth) to look at data and test nodes.
+// Every such call, reads included, waits for the user's approval. Builder edits only touch the draft;
+// running the workflow touches its apps, so it needs approval too.
+func builderDecisionNeedsApproval(decision AgentDecision) bool {
+	tool := strings.ToLower(decision.Tool)
+	normalizedTool := normalizeAgentToolName(decision.Tool)
+
+	isBuilderTool := len(normalizedTool) == 0 ||
+		normalizedTool == "shuffle workflows builder" || normalizedTool == "shuffle apps" || normalizedTool == "shuffles app management" ||
+		strings.Contains(tool, "de4ef2287bd41b9d5563e39989643ee6") || strings.Contains(tool, "7db43ccd25261967b095cfbd467a75cc") || strings.Contains(tool, "9f05339c05f9aaca4eeb35e6f13e41e6")
+	if isBuilderTool {
+		return strings.Contains(strings.ToLower(decision.Action), "run_workflow")
+	}
+
+	return true
+}
+
+// The model follows the action list it is shown over the rules text, so the old whole-app summaries
+// (replaced by the builder spec's get_search_actions and get_action) are hidden from it.
+func withoutRetiredBuilderActions(actions []WorkflowAppAction) []WorkflowAppAction {
+	kept := []WorkflowAppAction{}
+	for _, action := range actions {
+		if !isRetiredBuilderAction(action.Name) {
+			kept = append(kept, action)
+		}
+	}
+
+	return kept
+}
+
+// Only decisions that haven't started yet are started when their parents finish. A started one is already
+// running, finished, or WAITING on the user (an ask or a held approval). The previous decision's result can
+// arrive twice (a stream POST that timed out after being received, then the in-process fallback), and
+// restarting an ask then marks it running and completed with no answer, so the UI shows the agent thinking.
+func shouldStartChainedDecision(decision AgentDecision) bool {
+	if decision.Action == "ask" || decision.Action == "question" {
+		return false
+	}
+	return len(decision.RunDetails.Status) == 0
+}
+
+// Old lookups search_actions/get_action replaced: every action of an app at once, or every app at once
+func isRetiredBuilderAction(name string) bool {
+	normalized := normalizeToolName(name)
+	return strings.Contains(normalized, "actionssummary") || strings.Contains(normalized, "appssummary") || strings.Contains(normalized, "appsummary")
+}
+
+// The app management tool only duplicates Shuffle Apps' lookups, which search_actions replaced
+const appManagementAppId = "9f05339c05f9aaca4eeb35e6f13e41e6"
+
+// Ready apps from this run's app lookups, as "app:<id>:<name>" tool entries for the agent's tool list
+func getBuilderReadyAppTools(ctx context.Context, execution WorkflowExecution, startNodeId string) []string {
+	for _, result := range execution.Results {
+		if result.Action.ID != startNodeId {
+			continue
+		}
+
+		raw := result.Result
+		if strings.Contains(raw, "Result too large to handle") {
+			if fullValue, err := getExecutionFileValue(ctx, execution, result); err == nil && len(fullValue) > 0 {
+				raw = fullValue
+			}
+		}
+
+		previousOutput := AgentOutput{}
+		if err := json.Unmarshal([]byte(cleanAgentResultString(raw)), &previousOutput); err != nil {
+			return nil
+		}
+
+		tools := []string{}
+		for _, app := range getBuilderLookupReadyApps(previousOutput.Decisions) {
+			tools = append(tools, fmt.Sprintf("app:%s:%s", app.AppID, strings.ReplaceAll(strings.ToLower(app.AppName), " ", "_")))
+		}
+		return tools
+	}
+
+	return nil
+}
+
+// Number of action nodes (not triggers) a put_agent_update decision adds
+func countBuilderActionNodesAdded(decision AgentDecision) int {
+	if !strings.Contains(strings.ToLower(decision.Action), "agent_update") {
+		return 0
+	}
+
+	for _, field := range decision.Fields {
+		if field.Key != "body" {
+			continue
+		}
+
+		body := struct {
+			Operations []struct {
+				Op       string `json:"op"`
+				NodeType string `json:"node_type"`
+			} `json:"operations"`
+		}{}
+		if err := json.Unmarshal([]byte(field.Value), &body); err != nil {
+			return 0
+		}
+
+		count := 0
+		for _, op := range body.Operations {
+			if op.Op == "add_node" && !strings.EqualFold(op.NodeType, "trigger") {
+				count++
+			}
+		}
+		return count
+	}
+
+	return 0
 }
 
 // resolveAllowedApps returns the union of:
@@ -8753,78 +8817,7 @@ func buildAgentPermissionsPolicy(ctx context.Context, orgId string, skill string
 }
 
 func buildIncidentHandlerContext(ctx context.Context, execution WorkflowExecution) (string, string, []string, error) {
-	systemRule := `# ROLE & MISSION: INCIDENT HANDLER
-You are the Incident Handler, an expert security co-pilot and incident investigation partner within Shuffle.
-Your mission is to TRIAGE, INVESTIGATE, CONTAIN, and RESPOND HOLISTICALLY to security alerts and incidents, working alongside human incident responders and SOC analysts.
-
-# CRITICAL OPERATING PRINCIPLES
-1. DUAL OPERATING POSTURE (AUTONOMOUS RESOLVER VS ANALYST COPILOT):
-   - Simple / Benign / Routine Alerts (False Positives, Authorized Scanners, Duplicates): Act as an AUTONOMOUS RESOLVER. Verify technical evidence, document findings, set status to "resolved", and close cleanly with zero open tasks.
-   - Complex Incidents & Confirmed Threats (Malware, C2 Beaconing, Ransomware, Lateral Movement): Act as an ANALYST COPILOT. Do NOT attempt to close the incident autonomously. Your mission is to prepare the case and accelerate the human analyst:
-     * Extract and correlate observables and forensic telemetry.
-     * Generate structured response tasks across categories (investigation, containment, documentation) so the analyst has an immediate operational roadmap.
-     * Queue priority containment actions for human confirmation (approval_required: true).
-     * Set status to "in_progress" or "escalated".
-
-2. ACTION BIAS WITH RISK GOVERNANCE:
-   - Gather facts, enrich observables, analyze attack sequences, correlate alerts, and execute routine triage autonomously.
-   - For routine low-risk actions (closing false positives, adding documentation, checking threat intel, querying SIEM/EDR, proposing detection tuning): act decisively.
-   - For disruptive, destructive, or high-impact actions (isolating production endpoints, revoking executive accounts, pushing firewall blocks): set "approval_required": true and seek analyst confirmation.
-
-# HOLISTIC INCIDENT RESPONSE MATRIX (NIST / SANS ALIGNED)
-When evaluating an incident, execute the appropriate response path:
-
-1. AUTO-RESOLVE / JUST CLOSE (Benign, False Positive, Duplicate, or Test ONLY):
-   - Trigger: The alert is definitively verified as a vendor false positive, authorized administrative activity, routine cron/scanner noise, or a duplicate of an existing ticket.
-   - CRITICAL GUARDRAIL: NEVER set "status" to "resolved" if the alert is an active compromise, true positive threat (e.g. C2 beaconing, malware, credential theft), or if any open tasks remain. Completing initial triage does NOT resolve the incident.
-   - Action:
-     * Set "status" to "resolved" (or "closed").
-     * Add a clear audit entry to the activity array: {"ai_handled": true, "id": "status-{timestamp}", "type": "status", "user": "@AIAgent", "timestamp": {timestamp}, "content": "Resolved: [Specific evidence and rationale explaining why this is benign/FP/duplicate]"}.
-     * Do NOT create open tasks. Keep the record concise and clean.
-
-2. ESCALATE (High/Critical Threats, Active Compromise, or High Ambiguity):
-   - Trigger: Confirmed active malware/ransomware, credential theft, lateral movement, data exfiltration, critical asset compromise, or high-risk ambiguity requiring senior human judgment.
-   - Action:
-     * Update "severity" to "high" or "critical".
-     * Set "status" to "escalated".
-     * Add an urgent escalation entry to activity: {"ai_handled": true, "id": "status-{timestamp}", "type": "status", "user": "@AIAgent", "timestamp": {timestamp}, "content": "Escalated: High-priority threat detected. [Executive threat summary, affected assets/identities, blast radius, and immediate human actions needed]"}.
-     * Propose immediate containment steps for analyst authorization.
-
-3. CONTAINMENT & RESPONSE (Blocking, Isolating, Revoking):
-   - Tiered containment guidance:
-     * IMMEDIATE / LOW-RISK: Block malicious external IPs, domains, or file hashes at perimeter firewall/DNS/gateway; search fleet for IOC matches.
-     * MEDIUM-RISK: Invalidate active user tokens/sessions, force password reset upon next login.
-     * HIGH-RISK / CONFIRMATION REQUIRED: Isolate endpoint from network via EDR (CrowdStrike, SentinelOne, Defender), disable Active Directory/Okta user account. Set "approval_required": true.
-   - Always state: rationale, blast radius, and recovery/rollback procedure.
-
-4. FIX SPAMMY DETECTIONS (Detection Engineering & Tuning):
-   - Trigger: Alert is generated by a noisy, brittle, or misconfigured detection rule firing repeatedly on benign business operations (e.g. software deployment, health check, backup script).
-   - Action:
-     * Identify the root detection rule name and query logic.
-     * Propose specific tuning recommendations: exact exclusion filters, threshold adjustments, or suppression logic.
-     * Record the tuning proposal in incident activity or create a task: {"assignee": "AI Agent", "title": "Tune detection rule: [Rule Name] to exclude [Pattern]", "category": "triage", "action": "tune", "source": "detection_rule", "completed": false, "createdBy": "ai-agent@shuffler.io"}.
-
-5. TOOL USAGE & REQUESTING TOOLS:
-   - Leverage all available tools in context (shuffle_incidents, EDR, SIEM, threat intel).
-   - If an essential investigation or containment tool (e.g. VirusTotal, CrowdStrike, Okta, Splunk, Shodan, Jira) is missing or unauthenticated:
-     * Explicitly state what tool is required, why it is needed, and the specific query/action you intend to run.
-     * Ask the analyst to connect or authorize the tool, or emit a clear request to the user.
-
-6. INVESTIGATION, TASKS & DOCUMENTATION:
-   - For ongoing investigations or active threats, set "status" to "in_progress" (or "escalated" for high/critical threats). NEVER set "status" to "resolved" while open containment or investigation tasks exist.
-   - For progress notes and triage summaries, add activity with type "comment", NOT type "status": {"ai_handled": true, "id": "comment-{timestamp}", "type": "comment", "user": "@AIAgent", "timestamp": {timestamp}, "content": "Triage findings: [Summary of verified telemetry, indicators, and immediate actions]"}.
-   - Generate structured tasks in JSON format: {"tasks": [{"assignee": "AI Agent", "title": "...", "category": "triage/investigation/containment/recovery/communication/documentation", "action": "isolate/block/revoke/query/tune/document/etc.", "source": "sentinelone/crowdstrike/okta/splunk/virustotal/manual/etc.", "completed": false, "createdBy": "ai-agent@shuffler.io"}]}.
-   - Document comprehensive incident notes:
-     * Executive Summary: What happened and current status
-     * Scope & Affected Assets: Hostnames, identities, IP addresses
-     * MITRE ATT&CK Mapping: Tactics and techniques observed
-     * Evidence & IOCs: Hashes, external IPs, malicious URLs, process chains
-     * Actions Taken & Next Steps
-   - Leave generated tasks open (completed: false) for the analyst and incident response team to coordinate and track. Do NOT prematurely mark tasks completed or close the incident.
-
-# DATA FORMAT & MODIFICATIONS
-- Update the internal datastore with category 'shuffle-security_incidents' and the incident key.
-- ONLY send the modified fields in JSON format. Do NOT overwrite unrelated fields.`
+	systemRule := agentSkillBody("incident-handler")
 
 	orgId := strings.TrimSpace(execution.ExecutionOrg)
 	if len(orgId) == 0 {
@@ -8882,53 +8875,7 @@ When evaluating an incident, execute the appropriate response path:
 }
 
 func buildVulnerabilityManagementContext(ctx context.Context, execution WorkflowExecution) (string, string, []string, error) {
-	systemRule := `# ROLE & MISSION: VULNERABILITY MANAGEMENT SPECIALIST
-You are the Vulnerability Management Specialist, a supportive, empathetic, and pragmatic security advisor within Shuffle.
-Your mission is to HELP USERS SOLVE VULNERABILITIES with minimal friction, maximum clarity, and zero unnecessary anxiety.
-
-CRITICAL OPERATING PRINCIPLE:
-Vulnerability reports can be overwhelming, confusing, and full of high CVSS scores that lack real-world context.
-Your goal is first of all to be SUPPORTIVE, APPROACHABLE, and ACTIONABLE to the person asking:
-1. Demystify the vulnerability in plain, human language—explain what it actually means, how an attacker could exploit it, and whether it represents a real threat in the user's specific setup.
-2. Prioritize what truly matters based on real-world exploitability (CISA KEV, EPSS score, public exploit availability, exposure to the internet) rather than raw theoretical CVSS score.
-3. Provide concrete, step-by-step remediation plans with exact commands, package updates, configuration changes, or compensating controls.
-4. Encourage and partner with the user, respecting operational realities like service uptime, maintenance windows, and potential breaking changes.
-
-# SUPPORTIVE PROBLEM-SOLVING METHODOLOGY
-1. CLARIFY & DEMYSTIFY:
-   - Explain the vulnerability (CVE, CWE) in plain English without excessive academic jargon.
-   - Clarify the attack prerequisite: Does it require local access, authenticated privileges, or is it unauthenticated remote code execution (RCE)?
-   - Clearly state what an attacker could achieve if exploited (information disclosure, denial of service, privilege escalation, remote execution).
-
-2. REAL-WORLD RISK PRIORITIZATION:
-   - Evaluate exploitability beyond CVSS:
-     * CISA KEV: Is this known to be actively exploited in the wild?
-     * EPSS: Is there a high probability of exploitation?
-     * Exploit Availability: Are there public weaponized PoCs (Metasploit, GitHub exploits)?
-     * Exposure Context: Is the vulnerable asset internet-facing, or isolated in an internal, non-routable subnet?
-     * Asset Criticality: Does the affected system store sensitive PII, credentials, or crown-jewel data?
-   - Classify urgency pragmatically:
-     * Immediate Patching (Active exploit in wild + internet facing)
-     * Next Maintenance Window (High severity but internal/mitigated)
-     * Scheduled / Backlog (Low exploitability, defense-in-depth compensating controls exist)
-     * Potential False Positive or Non-Applicable (Vulnerable code path not used or package not loaded)
-
-3. ACTIONABLE REMEDIATION GUIDANCE:
-   - Give exact, copy-pasteable remediation commands whenever available:
-     * OS Packages: apt update && apt-get install --only-upgrade <package>, dnf upgrade <package>, apk add --upgrade <package>
-     * Language Ecosystems: npm audit fix, pip install <pkg>==<safe_version>, cargo update, mvn versions:use-latest-releases, go get -u <module>
-     * Docker/Containers: Base image update recommendations, multi-stage build pruning
-   - Provide configuration mitigations or temporary workarounds if patching would break production or requires an outage window.
-   - Suggest compensating controls (e.g. WAF rules, network ACLs, disabling unused modules/ports).
-
-4. VERIFICATION & FOLLOW-THROUGH:
-   - Explain how the user can verify that the vulnerability is resolved (checking package version, querying asset inventory, checking open ports).
-   - Offer to help inspect other assets for the same vulnerability or draft a remediation ticket/task.
-
-# TONE & STYLE
-- Supportive, encouraging, practical, and solution-oriented.
-- Never scold, panic, or overwhelm the user.
-- Focus on practical solutions and clear tradeoffs.`
+	systemRule := agentSkillBody("vulnerability-management")
 
 	templateContext := ""
 	vulnerabilityId := strings.TrimSpace(execution.ExecutionArgument)
@@ -9001,14 +8948,19 @@ func getWorkflowEditPromptRemovals() []string {
 data_filter:
 - "full": The default value of the data_filter is full. Use for all non-data-returning calls or when you need the entire response.
 - "list": Use for ALL data calls. Request ONLY essential fields. If the schema is completely unknown, fallback to "full"`,
+		// The builder asks the user for design choices (trigger, apps, criteria): see PLAN FIRST in its skill
+		` Don't be too verbose, and ask as few questions as possible.`,
+		`4. Do NOT ask unnecessary questions. Make assumptions for the user.`,
+		`Make decisions FOR the user instead of asking. `,
+		`Do NOT ask unless absolutely necessary. This command should generally be avoided in favor of action bias. `,
+		`- Avoid asking questions. Have an action bias and make decisions for the user!`,
 	}
 }
 
 func filterSystemPromptByTemplate(template string, systemMessage string) string {
 	var removals []string
 
-	switch template {
-	case "workflow-edit", "edit-workflow":
+	if isWorkflowBuilderTemplate(template) {
 		removals = getWorkflowEditPromptRemovals()
 	}
 
@@ -9478,6 +9430,17 @@ func HandleAiAgentExecutionStart(execution WorkflowExecution, startNode Action, 
 			param.Value = strings.ReplaceAll(param.Value, "app:undefined:api,", "")
 			param.Value = strings.ReplaceAll(param.Value, "app:undefined:api", "")
 
+			// Builder runs: apps the lookup returned as ready become real tools in the next turns,
+			// so the agent can read their data and test nodes instead of guessing
+			if param.Name == "action" && createNextActions && isWorkflowBuilderTemplate(template) {
+				for _, extraTool := range getBuilderReadyAppTools(ctx, execution, startNode.ID) {
+					appId := strings.Split(extraTool, ":")[1]
+					if !strings.Contains(strings.ToLower(param.Value), strings.ToLower(appId)) {
+						param.Value += "," + extraTool
+					}
+				}
+			}
+
 			for _, actionStr := range strings.Split(param.Value, ",") {
 				actionStr = strings.ToLower(strings.TrimSpace(actionStr))
 
@@ -9494,6 +9457,9 @@ func HandleAiAgentExecutionStart(execution WorkflowExecution, startNode Action, 
 
 				trimmedActionStr := strings.TrimSpace(strings.TrimPrefix(actionStr, "app:"))
 				if trimmedActionStr == "" || trimmedActionStr == "openai" {
+					continue
+				}
+				if isWorkflowBuilderTemplate(template) && (strings.Contains(trimmedActionStr, appManagementAppId) || strings.Contains(trimmedActionStr, "shuffles_app_management")) {
 					continue
 				}
 
@@ -9735,6 +9701,10 @@ func HandleAiAgentExecutionStart(execution WorkflowExecution, startNode Action, 
 				sort.Slice(sortedAppActions, func(i, j int) bool {
 					return sortedAppActions[i].Name < sortedAppActions[j].Name
 				})
+
+				if isWorkflowBuilderTemplate(template) {
+					sortedAppActions = withoutRetiredBuilderActions(sortedAppActions)
+				}
 
 				// Cuts off the potential md5:appname or uuid:appname prefix
 				baseToolName := trimmedActionStr
@@ -10192,6 +10162,7 @@ func HandleAiAgentExecutionStart(execution WorkflowExecution, startNode Action, 
 				log.Printf("[INFO][%s] AI_AGENT: org=%s decisions_total=%d failures=%d successes=%d last_index=%d", execution.ExecutionId, execution.Workflow.OrgId, len(mappedResult.Decisions), failureCount, successCount, lastFinishedIndex)
 			}
 
+			relevantDecisions = shrinkAgentHistoryDecisions(relevantDecisions)
 			marshalledDecisions, err = json.Marshal(relevantDecisions)
 			if err != nil {
 				log.Printf("[ERROR][%s] AI Agent: Failed marshalling decisions for action %s: %s", execution.ExecutionId, startNode.ID, err)
@@ -11594,6 +11565,11 @@ data_filter:
 				}
 			}
 
+			// Builder runs: force approval for app calls that can change data, whatever the model set
+			if (isWorkflowBuilderTemplate(template) || isWorkflowBuilderTemplate(agentOutput.Template)) && decision.Category == "singul" && !decision.ApprovalRequired && builderDecisionNeedsApproval(decision) {
+				decision.ApprovalRequired = true
+			}
+
 			agentOutput.Decisions[decisionIndex] = decision
 
 			// Handles approvals
@@ -12407,7 +12383,8 @@ func RunAiQuery(ctx context.Context, info AiCallInfo, systemMessage, userMessage
 				aiRequestUrl = foundRequestUrl
 			}
 
-			if len(currentModel) == 0 || !strings.HasPrefix(currentModel, "google/") {
+			// anthropic/<model> runs Claude on Vertex through vertexAnthropicTransport
+			if len(currentModel) == 0 || !(strings.HasPrefix(currentModel, "google/") || strings.HasPrefix(currentModel, "anthropic/")) {
 				currentModel = foundModel
 			}
 		}
@@ -12709,6 +12686,9 @@ func RunAiQuery(ctx context.Context, info AiCallInfo, systemMessage, userMessage
 
 	config.HTTPClient = &http.Client{
 		Transport: aiTransport,
+	}
+	if isVertexAnthropic(chatCompletion.Model, config.BaseURL) {
+		config.HTTPClient = &http.Client{Transport: vertexAnthropicTransport{}}
 	}
 	openaiClient := openai.NewClientWithConfig(config)
 
@@ -17165,7 +17145,6 @@ func inferMCPActionBehavior(action WorkflowAppAction) (readOnly bool, destructiv
 		"count": true, "head": true, "options": true, "export": true, "download": true,
 		"retrieve": true, "browse": true, "scan": true, "ping": true, "test": true,
 	}
-
 	for _, tok := range tokens {
 		if destructiveKeywords[tok] {
 			return false, true, true
@@ -18114,4 +18093,204 @@ func ValidateURLandModel(aiRequestUrl string, currentModel string) (string, stri
 	}
 
 	return aiRequestUrl, currentModel
+}
+
+// ---- Claude on Vertex AI (AI_MODEL=anthropic/<model>) ----
+
+// Lets the OpenAI client talk to Claude on Vertex AI. Vertex only serves Claude through its
+// native Anthropic endpoint (:streamRawPredict, Messages API), not the OpenAI-compatible
+// endpoints/openapi one, so this transport rewrites chat/completions requests and translates
+// the SSE stream back. Enabled by AI_MODEL=anthropic/<model> (e.g. anthropic/claude-haiku-5-5).
+// ponytail: text-only (no tool calls / images) — that's all RunAiQuery sends today.
+
+type vertexAnthropicTransport struct{}
+
+func isVertexAnthropic(model, url string) bool {
+	return strings.HasPrefix(model, "anthropic/") && strings.Contains(url, "googleapis.com")
+}
+
+func (vertexAnthropicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !strings.HasSuffix(req.URL.Path, "/endpoints/openapi/chat/completions") || req.Body == nil {
+		return http.DefaultTransport.RoundTrip(req)
+	}
+
+	in, err := io.ReadAll(req.Body)
+	req.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+
+	model, body, err := openaiToAnthropicBody(in)
+	if err != nil {
+		return nil, err
+	}
+
+	newReq := req.Clone(req.Context())
+	newReq.URL.Path = strings.TrimSuffix(req.URL.Path, "/endpoints/openapi/chat/completions") + "/publishers/anthropic/models/" + model + ":streamRawPredict"
+	newReq.Body = io.NopCloser(bytes.NewReader(body))
+	newReq.ContentLength = int64(len(body))
+	newReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultTransport.RoundTrip(newReq)
+	if err != nil || resp.StatusCode >= 300 {
+		return resp, err
+	}
+
+	pr, pw := io.Pipe()
+	go anthropicSSEToOpenAI(resp.Body, pw, model)
+	resp.Body = pr
+	resp.Header.Set("Content-Type", "text/event-stream")
+	resp.ContentLength = -1
+	return resp, nil
+}
+
+func openaiToAnthropicBody(in []byte) (string, []byte, error) {
+	var oa struct {
+		Model               string   `json:"model"`
+		MaxTokens           int      `json:"max_tokens"`
+		MaxCompletionTokens int      `json:"max_completion_tokens"`
+		Temperature         *float32 `json:"temperature"`
+		Messages            []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(in, &oa); err != nil {
+		return "", nil, err
+	}
+
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	system := []string{}
+	messages := []msg{}
+	for _, m := range oa.Messages {
+		text := ""
+		if json.Unmarshal(m.Content, &text) != nil {
+			parts := []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			}{}
+			json.Unmarshal(m.Content, &parts)
+			for _, p := range parts {
+				text += p.Text
+			}
+		}
+		if len(strings.TrimSpace(text)) == 0 {
+			continue
+		}
+
+		role := "user"
+		if m.Role == "system" || m.Role == "developer" {
+			system = append(system, text)
+			continue
+		} else if m.Role == "assistant" {
+			role = "assistant"
+		}
+
+		// Anthropic wants alternating turns
+		if len(messages) > 0 && messages[len(messages)-1].Role == role {
+			messages[len(messages)-1].Content += "\n\n" + text
+		} else {
+			messages = append(messages, msg{Role: role, Content: text})
+		}
+	}
+
+	if len(messages) == 0 || messages[0].Role != "user" {
+		messages = append([]msg{{Role: "user", Content: "Continue."}}, messages...)
+	}
+
+	maxTokens := oa.MaxTokens
+	if oa.MaxCompletionTokens > 0 {
+		maxTokens = oa.MaxCompletionTokens
+	}
+	if maxTokens <= 0 {
+		maxTokens = 16000
+	}
+
+	out := map[string]interface{}{
+		"anthropic_version": "vertex-2023-10-16",
+		"max_tokens":        maxTokens,
+		"messages":          messages,
+		"stream":            true,
+	}
+	if len(system) > 0 {
+		out["system"] = strings.Join(system, "\n\n")
+	}
+	if oa.Temperature != nil {
+		out["temperature"] = *oa.Temperature
+	}
+
+	body, err := json.Marshal(out)
+	return strings.TrimPrefix(oa.Model, "anthropic/"), body, err
+}
+
+// Anthropic SSE (message_start / content_block_delta / message_delta) -> OpenAI chunk SSE
+func anthropicSSEToOpenAI(src io.ReadCloser, dst *io.PipeWriter, model string) {
+	defer src.Close()
+
+	write := func(chunk map[string]interface{}) {
+		chunk["object"] = "chat.completion.chunk"
+		chunk["model"] = model
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(dst, "data: %s\n\n", b)
+	}
+
+	inputTokens, outputTokens := 0, 0
+	scanner := bufio.NewScanner(src)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+
+		var ev struct {
+			Type    string `json:"type"`
+			Message struct {
+				Usage struct {
+					InputTokens int `json:"input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+			Delta struct {
+				Type       string `json:"type"`
+				Text       string `json:"text"`
+				StopReason string `json:"stop_reason"`
+			} `json:"delta"`
+			Usage struct {
+				OutputTokens int `json:"output_tokens"`
+			} `json:"usage"`
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &ev) != nil {
+			continue
+		}
+
+		switch ev.Type {
+		case "message_start":
+			inputTokens = ev.Message.Usage.InputTokens
+		case "content_block_delta":
+			if ev.Delta.Type == "text_delta" {
+				write(map[string]interface{}{"choices": []interface{}{map[string]interface{}{"index": 0, "delta": map[string]string{"content": ev.Delta.Text}}}})
+			}
+		case "message_delta":
+			outputTokens = ev.Usage.OutputTokens
+			finish := "stop"
+			if ev.Delta.StopReason == "max_tokens" {
+				finish = "length"
+			}
+			write(map[string]interface{}{"choices": []interface{}{map[string]interface{}{"index": 0, "delta": map[string]string{}, "finish_reason": finish}}})
+		case "error":
+			dst.CloseWithError(fmt.Errorf("vertex anthropic stream error: %s", ev.Error.Message))
+			return
+		}
+	}
+
+	write(map[string]interface{}{"choices": []interface{}{}, "usage": map[string]int{"prompt_tokens": inputTokens, "completion_tokens": outputTokens, "total_tokens": inputTokens + outputTokens}})
+	fmt.Fprint(dst, "data: [DONE]\n\n")
+	dst.CloseWithError(scanner.Err())
 }

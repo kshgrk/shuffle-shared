@@ -1,11 +1,13 @@
 package shuffle
 
 import (
+	"github.com/frikky/kin-openapi/openapi3"
 	"bytes"
 	"cloud.google.com/go/datastore"
 	pb "cloud.google.com/go/datastore/apiv1/datastorepb"
 	"cloud.google.com/go/storage"
 	"context"
+	"regexp"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -4991,5 +4993,582 @@ func TestDatastoreEnrichmentsTagsRevisionsSuborgAndTimeout(t *testing.T) {
 	}
 	if len(ttlKeys) != 1 || ttlKeys[0].Key != "fresh_key" {
 		t.Fatalf("expected expired_key to be auto-removed by category Timeout=120, got %+v", ttlKeys)
+	}
+}
+
+// ---- Workflow builder agent: app calls with the user's auth + approval for writes ----
+
+func TestWorkflowBuilderAgentAppCalls(t *testing.T) {
+	// A duplicate delivery of the previous result must not restart an ask or a decision that already started
+	for _, decision := range []AgentDecision{
+		{Action: "ask", Category: "standalone", RunDetails: AgentDecisionRunDetails{Status: "WAITING"}},
+		{Action: "ask", Category: "standalone"},
+		{Action: "get_message", Category: "singul", RunDetails: AgentDecisionRunDetails{Status: "WAITING"}},
+		{Action: "get_message", Category: "singul", RunDetails: AgentDecisionRunDetails{Status: "RUNNING"}},
+		{Action: "get_message", Category: "singul", RunDetails: AgentDecisionRunDetails{Status: "FINISHED"}},
+	} {
+		if shouldStartChainedDecision(decision) {
+			t.Errorf("must not start %s in status %q", decision.Action, decision.RunDetails.Status)
+		}
+	}
+	if !shouldStartChainedDecision(AgentDecision{Action: "get_message", Category: "singul"}) {
+		t.Error("a queued decision must start once its parent finishes")
+	}
+
+	// The builder's listed actions hide the whole-app summaries; get_search_actions/get_action come from its spec
+	builderActions := []WorkflowAppAction{{Name: "post_agent_update"}, {Name: "post_get_app_actions_summary"}, {Name: "get_get_apps_summary"}, {Name: "post_get_actions_summary"}}
+	names := func(actions []WorkflowAppAction) string {
+		out := []string{}
+		for _, action := range actions {
+			out = append(out, action.Name)
+		}
+		return strings.Join(out, ",")
+	}
+	if got := names(withoutRetiredBuilderActions(builderActions)); got != "post_agent_update" {
+		t.Errorf("retired summaries must be hidden: %s", got)
+	}
+
+	// Old lookups answer with a pointer to the new tools instead of reaching a real app
+	previousRouter := InternalRouter
+	InternalRouter = http.NewServeMux()
+	defer func() { InternalRouter = previousRouter }()
+	for _, name := range []string{"post_get_app_actions_summary", "get_get_apps_summary", "post_get_actions_summary"} {
+		retired, ok := getWorkflowBuilderRequest(WorkflowExecution{}, AgentDecision{Tool: "shuffle_apps", Action: name})
+		if !ok {
+			t.Fatalf("%s must be handled in-process", name)
+		}
+		recorder := httptest.NewRecorder()
+		retired.Handler(recorder, httptest.NewRequest("GET", retired.Path, nil))
+		if recorder.Code != 410 || !strings.Contains(recorder.Body.String(), "search_actions") {
+			t.Errorf("%s: %d %s", name, recorder.Code, recorder.Body.String())
+		}
+	}
+
+	// Every real app call needs approval, reads included
+	for _, name := range []string{"get_gmail_users_messages_list", "append_values", "execute_python", "custom_action"} {
+		if !builderDecisionNeedsApproval(AgentDecision{Tool: "Gmail", Action: name}) {
+			t.Errorf("%s on an app should need approval", name)
+		}
+	}
+
+	if builderDecisionNeedsApproval(AgentDecision{Tool: "Shuffle_Workflows_Builder", Action: "put_agent_update"}) {
+		t.Error("draft edits should not need approval")
+	}
+	if builderDecisionNeedsApproval(AgentDecision{Tool: "shuffle_apps", Action: "search_actions"}) {
+		t.Error("app lookup should not need approval")
+	}
+	if !builderDecisionNeedsApproval(AgentDecision{Tool: "Shuffle_Workflows_Builder", Action: "post_run_workflow"}) {
+		t.Error("running the workflow should need approval")
+	}
+
+	lookup := `{"body":{"results":[{"app":"Gmail","app_id":"794e","action":"list","ready":true},{"app":"Google_Sheets","app_id":"fe62","action":"append","ready":false}]},"success":true}`
+	output := AgentOutput{
+		Template:       "edit-workflow",
+		AllowedActions: []string{"app:de4ef2287bd41b9d5563e39989643ee6:shuffle_workflows_builder"},
+		Decisions:      []AgentDecision{{Action: "search_actions", RunDetails: AgentDecisionRunDetails{RawResponse: lookup}}},
+	}
+
+	if ok, _ := isAgentToolAllowed(output, AgentDecision{Tool: "gmail"}); !ok {
+		t.Error("authenticated app from the lookup should be allowed")
+	}
+	if ok, _ := isAgentToolAllowed(output, AgentDecision{Tool: "Google Sheets"}); ok {
+		t.Error("unauthenticated app should stay blocked")
+	}
+	if ok, _ := isAgentToolAllowed(output, AgentDecision{Tool: "Slack"}); ok {
+		t.Error("app not in the lookup should stay blocked")
+	}
+
+	output.Template = "incident-response"
+	if ok, _ := isAgentToolAllowed(output, AgentDecision{Tool: "gmail"}); ok {
+		t.Error("non-builder runs keep the fixed allow list")
+	}
+
+	if !isAgentDecisionApproved(AgentDecision{Fields: []Valuereplace{{Key: "approve", Value: "Approved to continue at now"}}}) {
+		t.Error("approved field not detected")
+	}
+
+	// A model copying an earlier approval into a new step must not skip the user's approval
+	copied := `[{"i":5,"action":"get_gmail_users_messages_list","category":"singul","tool":"Gmail","fields":[{"key":"q","value":"signup"},{"key":"approve","value":"Approved to continue at Tue, 24 Nov 2026 10:08:14 IST"}]}]`
+	parsed, err := parseAgentDecisions(copied)
+	if err != nil || len(parsed) != 1 {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if isAgentDecisionApproved(parsed[0]) || len(parsed[0].Fields) != 1 || parsed[0].Fields[0].Key != "q" {
+		t.Errorf("model-written approve field must be stripped, got %+v", parsed[0].Fields)
+	}
+	if !builderDecisionNeedsApproval(parsed[0]) {
+		t.Error("the copied step must still need approval")
+	}
+
+	ready := getBuilderLookupReadyApps(output.Decisions)
+	if len(ready) != 1 || ready[0].AppName != "Gmail" {
+		t.Errorf("expected only Gmail ready, got %+v", ready)
+	}
+
+	oneNode := `{"workflow_id":"x","operations":[{"op":"add_node","node_type":"trigger"},{"op":"add_node","node_type":"action"},{"op":"add_branch"}]}`
+	if n := countBuilderActionNodesAdded(AgentDecision{Action: "put_agent_update", Fields: []Valuereplace{{Key: "body", Value: oneNode}}}); n != 1 {
+		t.Errorf("expected 1 action node, got %d", n)
+	}
+	twoNodes := `{"workflow_id":"x","operations":[{"op":"add_node","node_type":"action"},{"op":"add_node"}]}`
+	if n := countBuilderActionNodesAdded(AgentDecision{Action: "put_agent_update", Fields: []Valuereplace{{Key: "body", Value: twoNodes}}}); n != 2 {
+		t.Errorf("expected 2 action nodes, got %d", n)
+	}
+}
+
+// ---- Claude on Vertex AI adapter ----
+
+func TestVertexAnthropicAdapter(t *testing.T) {
+	if !isVertexAnthropic("anthropic/claude-haiku-5-5", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi") {
+		t.Error("anthropic model on Vertex should use the adapter")
+	}
+	if isVertexAnthropic("google/gemini-3.7-flash", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi") {
+		t.Error("gemini must not use the adapter")
+	}
+
+	in := `{"model":"anthropic/claude-haiku-5-5","max_tokens":500,"messages":[{"role":"system","content":"sys"},{"role":"user","content":"a"},{"role":"user","content":"b"},{"role":"assistant","content":"c"}]}`
+	model, body, err := openaiToAnthropicBody([]byte(in))
+	if err != nil || model != "claude-haiku-5-5" {
+		t.Fatalf("model %q err %v", model, err)
+	}
+	out := map[string]interface{}{}
+	json.Unmarshal(body, &out)
+	msgs := out["messages"].([]interface{})
+	if out["system"] != "sys" || len(msgs) != 2 || msgs[0].(map[string]interface{})["content"] != "a\n\nb" || out["max_tokens"].(float64) != 500 {
+		t.Errorf("bad anthropic body: %s", body)
+	}
+
+	sse := "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7}}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"[{\\\"action\\\":\"}}\n\n" +
+		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"\\\"finish\\\"}]\"}}\n\n" +
+		"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n"
+	pr, pw := io.Pipe()
+	go anthropicSSEToOpenAI(io.NopCloser(strings.NewReader(sse)), pw, "claude-haiku-5-5")
+	converted, _ := io.ReadAll(pr)
+	text := ""
+	for _, line := range strings.Split(string(converted), "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		chunk := struct {
+			Choices []struct {
+				Delta struct{ Content string } `json:"delta"`
+			} `json:"choices"`
+		}{}
+		json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk)
+		for _, c := range chunk.Choices {
+			text += c.Delta.Content
+		}
+	}
+	if text != `[{"action":"finish"}]` || !strings.Contains(string(converted), `"total_tokens":12`) || !strings.HasSuffix(string(converted), "data: [DONE]\n\n") {
+		t.Errorf("bad openai stream: %s", converted)
+	}
+}
+
+// ---- App action catalog ----
+
+const catalogTestNotionSpec = `{"paths":{
+ "/v1/search":{"post":{"operationId":"Search","summary":"Search","parameters":[
+   {"in":"body","name":"body","example":"","schema":{"type":"string"}},
+   {"in":"header","name":"Content-Type","example":"application/json","schema":{"type":"string"}},
+   {"in":"header","name":"Notion-Version","example":"{{NOTION_VERSION}}","schema":{"type":"string"}}]}},
+ "/v1/pages/{id}":{"get":{"operationId":"Retrieve_a_page","summary":"Retrieve a page","parameters":[
+   {"in":"path","name":"id","required":true,"description":"Page ID","schema":{"type":"string"}},
+   {"in":"header","name":"Notion-Version","example":"{{NOTION_VERSION}}","schema":{"type":"string"}}]}},
+ "/v1/blocks/{id}/children":{"patch":{"operationId":"Append_block_children","summary":"Append block children","parameters":[
+   {"in":"path","name":"id","required":true,"schema":{"type":"string"}},
+   {"in":"body","name":"body","example":"{\"children\": []}","schema":{"type":"string"}},
+   {"in":"header","name":"Authorization","example":"Bearer secret_t1CdN9S8yicG5eWLUOfhcWaOscVnFXns","schema":{"type":"string"}},
+   {"in":"header","name":"Notion-Version","example":"{{NOTION_VERSION}}","schema":{"type":"string"}}]}},
+ "/v1/blocks/{id}":{"delete":{"operationId":"Delete_a_block","summary":"Delete a block","parameters":[
+   {"in":"path","name":"id","required":true,"schema":{"type":"string"}},
+   {"in":"header","name":"Notion-Version","example":"{{NOTION_VERSION}}","schema":{"type":"string"}}]}}
+}}`
+
+func catalogTestParams(extra ...WorkflowAppActionParameter) []WorkflowAppActionParameter {
+	params := []WorkflowAppActionParameter{
+		{Name: "apikey", Required: true, Example: "The API key to use. Space = skip"},
+		{Name: "url", Required: true, Example: "https://api.notion.com"},
+		{Name: "headers", Example: "Content-Type=application/json\nAccept=application/json\r\n"},
+		{Name: "queries", Example: "view=basic&redirect=test"},
+		{Name: "ssl_verify", Example: "True"},
+		{Name: "to_file", Example: "False"},
+	}
+	return append(params, extra...)
+}
+
+func catalogTestApps() (WorkflowApp, WorkflowApp) {
+	notion := WorkflowApp{ID: "1e47402623b991139c558b15cd3a0591", Name: "Notion", Generated: true, Actions: []WorkflowAppAction{
+		{Name: "post_search", Label: "Search", Description: "\n\nhttps://api.notion.com/v1/search", Parameters: catalogTestParams(WorkflowAppActionParameter{Name: "body", Required: true, Description: "Generated by shuffler.io OpenAPI"})},
+		{Name: "get_retrieve_a_page", Label: "Retrieve a page", Description: "Retrieves a page object.\n\nhttps://api.notion.com/v1/pages/{id}", Parameters: catalogTestParams(WorkflowAppActionParameter{Name: "id", Required: true, Description: "Generated by shuffler.io OpenAPI"})},
+		{Name: "patch_append_block_children", Label: "Append block children", Description: "Appends blocks to a page.\n\nhttps://api.notion.com/v1/blocks/{id}/children", Parameters: catalogTestParams(WorkflowAppActionParameter{Name: "id", Required: true}, WorkflowAppActionParameter{Name: "body", Required: true, Example: "{\"children\": []}"})},
+		{Name: "delete_delete_a_block", Label: "Delete a block", Description: "Deletes a block.\n\nhttps://api.notion.com/v1/blocks/{id}", Parameters: catalogTestParams(WorkflowAppActionParameter{Name: "id", Required: true})},
+	}}
+	gmail := WorkflowApp{ID: "794e51c3c1a8b24b89ccc573a3defc47", Name: "Gmail", Actions: []WorkflowAppAction{
+		{Name: "get_gmail_users_messages_list", Label: "gmail.users.messages.list", Description: "Lists the messages in the user's mailbox.\n\nhttps://gmail.googleapis.com/gmail/v1/users/{userId}/messages", Parameters: []WorkflowAppActionParameter{{Name: "userId", Required: true}, {Name: "q"}, {Name: "maxResults"}}},
+		{Name: "gmail_users_messages_get", Label: "gmail.users.messages.get", Description: "Gets the specified message.\n\nhttps://gmail.googleapis.com/gmail/v1/users/{userId}/messages/{id}", Parameters: []WorkflowAppActionParameter{{Name: "userId", Required: true}, {Name: "id", Required: true}}},
+		{Name: "gmail_users_messages_send", Label: "gmail.users.messages.send", Description: "Sends the specified message to the recipients in the To, Cc, and Bcc headers.\n\nhttps://gmail.googleapis.com/gmail/v1/users/{userId}/messages/send", Parameters: []WorkflowAppActionParameter{{Name: "userId", Required: true}, {Name: "body", Required: true}}},
+		{Name: "gmail_users_messages_trash", Label: "gmail.users.messages.trash", Description: "Moves the specified message to the trash.", Parameters: []WorkflowAppActionParameter{{Name: "userId", Required: true}, {Name: "id", Required: true}}},
+		{Name: "gmail_users_settings_filters_delete", Label: "gmail.users.settings.filters.delete", Description: "Deletes a filter.", Parameters: []WorkflowAppActionParameter{{Name: "userId", Required: true}, {Name: "id", Required: true}}},
+	}}
+	return notion, gmail
+}
+
+func TestActionCatalogEntries(t *testing.T) {
+	notion, _ := catalogTestApps()
+	entries := buildAppActionCatalog(notion, catalogTestNotionSpec)
+	if len(entries) != 4 {
+		t.Fatalf("expected 4 entries, got %d", len(entries))
+	}
+
+	search := findCatalogEntry(entries, "post_search")
+	if search == nil || search.Method != "POST" || search.Path != "/v1/search" {
+		t.Fatalf("search not matched to its spec operation: %+v", search)
+	}
+	if search.Safety != "read" || search.SafetySource != "reviewed" || search.ApprovalMode != "allow" {
+		t.Errorf("search safety: %s/%s/%s", search.Safety, search.SafetySource, search.ApprovalMode)
+	}
+	if len(search.Params) != 1 || search.Params[0].Name != "body" || search.Params[0].In != "body" {
+		t.Errorf("auth and transport params must be hidden, got %+v", search.Params)
+	}
+	if catalogHeadersValue(search) != "Content-Type=application/json\nNotion-Version=2026-03-11" {
+		t.Errorf("headers value: %q", catalogHeadersValue(search))
+	}
+
+	page := findCatalogEntry(entries, "Retrieve a page")
+	if page == nil || page.Safety != "read" || page.SafetySource != "http_method" || page.Params[0].In != "path" || page.Summary != "Retrieves a page object." {
+		t.Errorf("retrieve page entry: %+v", page)
+	}
+
+	appendEntry := findCatalogEntry(entries, "patch_append_block_children")
+	for _, header := range appendEntry.Headers {
+		if catalogKey(header.Name) == "authorization" {
+			t.Error("Authorization header must not be in the entry")
+		}
+	}
+	if appendEntry.Safety != "write" || appendEntry.BodyExample != `{"children": []}` {
+		t.Errorf("append entry: %s %q", appendEntry.Safety, appendEntry.BodyExample)
+	}
+
+	if destructive := findCatalogEntry(entries, "delete_delete_a_block"); destructive.Safety != "destructive" || destructive.ApprovalMode != "always_confirm" {
+		t.Errorf("delete entry safety: %s", destructive.Safety)
+	}
+
+	marshalled, _ := json.Marshal(entries)
+	if strings.Contains(string(marshalled), "secret_") || strings.Contains(string(marshalled), "{{") {
+		t.Errorf("entries leak a secret or an unresolved placeholder: %s", marshalled)
+	}
+
+	unknown := WorkflowApp{ID: "x", Name: "X", Generated: true, Actions: []WorkflowAppAction{{Name: "post_thing", Label: "Thing", Parameters: []WorkflowAppActionParameter{{Name: "token", Example: "{{API_TOKEN}}"}}}}}
+	spec := `{"paths":{"/thing":{"post":{"summary":"Thing","parameters":[{"in":"header","name":"X-Version","example":"{{UNKNOWN_VERSION}}"}]}}}}`
+	thing := buildAppActionCatalog(unknown, spec)[0]
+	if !thing.Headers[0].NeedsValue || len(thing.Headers[0].Default) > 0 || !thing.Params[0].NeedsValue {
+		t.Errorf("unknown placeholders must be flagged needs_value: %+v", thing)
+	}
+}
+
+func TestActionCatalogSearch(t *testing.T) {
+	notion, gmail := catalogTestApps()
+	entries := append(buildAppActionCatalog(notion, catalogTestNotionSpec), buildAppActionCatalog(gmail, "")...)
+	ready := map[string]bool{notion.ID: true, gmail.ID: true}
+
+	cases := []struct {
+		query string
+		top   string
+		within int
+	}{
+		{"search notion pages", "post_search", 1},
+		{"list email messages", "get_gmail_users_messages_list", 1},
+		{"list gmail messages", "get_gmail_users_messages_list", 1},
+		{"send an email", "gmail_users_messages_send", 1},
+		{"delete a block in notion", "delete_delete_a_block", 1},
+		{"append rows to a notion page", "patch_append_block_children", 1},
+		{"find signup emails", "get_gmail_users_messages_list", 3},
+		{"read one email message", "gmail_users_messages_get", 2},
+		{"post_search", "post_search", 1},
+	}
+	for _, c := range cases {
+		hits := rankCatalogEntries(entries, c.query, ready, 8)
+		found := false
+		for i := 0; i < c.within && i < len(hits); i++ {
+			if hits[i].Action == c.top {
+				found = true
+			}
+		}
+		if !found {
+			names := []string{}
+			for _, hit := range hits {
+				names = append(names, fmt.Sprintf("%s(%.2f)", hit.Action, hit.Score))
+			}
+			t.Errorf("%q: expected %s in top %d, got %v", c.query, c.top, c.within, names)
+		}
+	}
+
+	if hits := rankCatalogEntries(entries, "list email messages", ready, 8); len(hits) > 0 && hits[0].AppName != "Gmail" {
+		t.Errorf("app ranking: %+v", hits[0])
+	}
+	if hits := rankCatalogEntries(entries, "zzzz nothing matches", ready, 8); len(hits) != 0 {
+		t.Errorf("unrelated query must return nothing, got %d", len(hits))
+	}
+	many := []CatalogActionEntry{}
+	for i := 0; i < 15; i++ {
+		many = append(many, CatalogActionEntry{AppID: "x", AppName: "X", Action: fmt.Sprintf("list_messages_%d", i)})
+	}
+	if hits := rankCatalogEntries(many, "list messages", nil, 50); len(hits) != 10 {
+		t.Errorf("limit must cap at 10, got %d", len(hits))
+	}
+
+	// One row per app with its description, generated-by text removed, connect_url only when not ready
+	hits := rankCatalogEntries(entries, "list messages search pages", map[string]bool{notion.ID: true}, 8)
+	describedNotion, describedGmail := catalogTestApps()
+	describedNotion.Description = "Notion workspace API Generated by shuffler.io OpenAPI"
+	rows := catalogHitApps(hits, []WorkflowApp{describedNotion, describedGmail})
+	if len(rows) != 2 {
+		t.Errorf("expected rows for Notion and Gmail, got %+v", rows)
+	}
+	byApp := map[string]CatalogHitApp{}
+	for _, row := range rows {
+		if _, dup := byApp[row.AppName]; dup {
+			t.Errorf("app %s listed twice", row.AppName)
+		}
+		byApp[row.AppName] = row
+	}
+	if row, ok := byApp["Notion"]; !ok || row.Description != "Notion workspace API" {
+		t.Errorf("notion app row: %+v", row)
+	}
+	for _, row := range rows {
+		if row.Ready == (row.ConnectURL != "") {
+			t.Errorf("connect_url must be set only when not ready: %+v", row)
+		}
+	}
+}
+
+// Mirrors the generated app's header parser: one header per line, split on the first ':' or '=', later lines win
+func catalogTestParseHeaders(value string) map[string]string {
+	headers := map[string]string{}
+	for _, line := range strings.Split(value, "\n") {
+		separator := ""
+		if strings.Contains(line, ":") {
+			separator = ":"
+		} else if strings.Contains(line, "=") {
+			separator = "="
+		}
+		if len(separator) == 0 {
+			continue
+		}
+		parts := strings.SplitN(line, separator, 2)
+		headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+	}
+	return headers
+}
+
+func TestComposeCatalogHeaders(t *testing.T) {
+	notion, _ := catalogTestApps()
+	search := findCatalogEntry(buildAppActionCatalog(notion, catalogTestNotionSpec), "post_search")
+
+	if headers := catalogTestParseHeaders(composeCatalogHeaders(search, "Notion-Version=Content-Type=application/json", "", nil)); headers["Notion-Version"] != "2026-03-11" {
+		t.Errorf("resolved default must beat a bad stored value, got %+v", headers)
+	}
+	if headers := catalogTestParseHeaders(composeCatalogHeaders(search, "", "Notion-Version: 2022-06-28", nil)); headers["Notion-Version"] != "2022-06-28" {
+		t.Errorf("agent headers text must win, got %+v", headers)
+	}
+	if headers := catalogTestParseHeaders(composeCatalogHeaders(search, "", "Notion-Version: 2022-06-28", map[string]string{"Notion-Version": "2025-09-03"})); headers["Notion-Version"] != "2025-09-03" || headers["Content-Type"] != "application/json" {
+		t.Errorf("a header set by name must win, got %+v", headers)
+	}
+}
+
+func TestCatalogBuilderDispatch(t *testing.T) {
+	// The builder spec's discovery and skill operations, as in shaffuru/frontend/workflow_builder_spec.json
+	spec := `{"openapi": "3.0.0", "info": {"title": "Shuffle Workflows Builder", "version": "1.0"}, "paths": {
+		"/api/v1/apps/actions/search": {"get": {"summary": "Search actions", "parameters": [
+			{"in": "query", "name": "query", "required": true, "schema": {"type": "string"}},
+			{"in": "query", "name": "app", "schema": {"type": "string"}},
+			{"in": "query", "name": "limit", "schema": {"type": "string"}}], "responses": {"default": {"description": "Result"}}}},
+		"/api/v1/apps/{app}/actions/{action}": {"get": {"summary": "Get action", "parameters": [
+			{"in": "path", "name": "app", "required": true, "schema": {"type": "string"}},
+			{"in": "path", "name": "action", "required": true, "schema": {"type": "string"}}], "responses": {"default": {"description": "Result"}}}},
+		"/api/v1/agent/skills/{name}/resources": {"get": {"summary": "Get skill resource", "parameters": [
+			{"in": "path", "name": "name", "required": true, "example": "workflow-builder", "schema": {"type": "string"}},
+			{"in": "query", "name": "path", "required": true, "schema": {"type": "string"}}], "responses": {"default": {"description": "Result"}}}}}}`
+	swagger, err := openapi3.NewSwaggerLoader().LoadSwaggerFromData([]byte(spec))
+	if err != nil {
+		t.Fatalf("spec: %s", err)
+	}
+	dispatch := func(action string, fields map[string]string) (workflowBuilderRequest, bool, bool) {
+		normalized := map[string]string{}
+		for key, value := range fields {
+			normalized[normalizeToolName(key)] = value
+		}
+		return findInternalAppRequest(swagger, normalizeToolName(action), normalized)
+	}
+
+	// The spec names them get_search_actions/get_action/get_skill_resource; the name without "get_" also works
+	for _, name := range []string{"get_search_actions", "search_actions"} {
+		search, found, ok := dispatch(name, map[string]string{"query": "list email messages", "app": "Gmail"})
+		if !found || !ok || search.Method != "GET" || !strings.HasPrefix(search.Path, "/api/v1/apps/actions/search?") || !strings.Contains(search.Path, "query=list+email+messages") || !strings.Contains(search.Path, "app=Gmail") {
+			t.Errorf("%s dispatch: %+v %v %v", name, search.Path, found, ok)
+		}
+	}
+	if got := specActionName("get", "Search actions"); got != "get_search_actions" {
+		t.Errorf("spec action name: %s", got)
+	}
+
+	fromBody, _, ok := dispatch("get_search_actions", map[string]string{"body": `{"query": "search pages", "app": "Notion"}`})
+	if !ok || !strings.Contains(fromBody.Path, "query=search+pages") || !strings.Contains(fromBody.Path, "app=Notion") {
+		t.Errorf("search dispatch from body: %+v", fromBody.Path)
+	}
+
+	get, _, ok := dispatch("get_action", map[string]string{"app": "Notion", "action": "post_search"})
+	if !ok || get.Path != "/api/v1/apps/Notion/actions/post_search" {
+		t.Errorf("get_action dispatch: %+v %v", get.Path, ok)
+	}
+	if _, found, ok := dispatch("get_action", map[string]string{"app": "Notion"}); !found || ok {
+		t.Error("get_action without an action must not dispatch")
+	}
+
+	resource, _, ok := dispatch("get_skill_resource", map[string]string{"path": "references/operations.md"})
+	if !ok || resource.Path != "/api/v1/agent/skills/workflow-builder/resources?path=references%2Foperations.md" {
+		t.Errorf("skill resource dispatch, name from the spec example: %+v %v", resource.Path, ok)
+	}
+
+	searchResponse := `{"success":true,"status":200,"body":{"results":[{"app":"Notion","app_id":"1e47","action":"post_search","ready":true},{"app":"Sheets","app_id":"fe62","action":"append","ready":false}]}}`
+	readyApps := getBuilderLookupReadyApps([]AgentDecision{{Action: "search_actions", RunDetails: AgentDecisionRunDetails{RawResponse: searchResponse}}})
+	if len(readyApps) != 1 || readyApps[0].AppID != "1e47" {
+		t.Errorf("ready apps from search: %+v", readyApps)
+	}
+}
+
+// ---- Agent skills (skills/<name>/SKILL.md, agentskills.io layout) ----
+
+func TestAgentSkills(t *testing.T) {
+	skills := loadAgentSkills()
+	for _, name := range []string{"workflow-builder", "incident-handler", "vulnerability-management", "computer-use"} {
+		skill, ok := skills[name]
+		if !ok || len(skill.Body) < 500 || len(skill.Description) == 0 || strings.HasPrefix(skill.Body, "---") {
+			t.Fatalf("skill %s did not load: %+v", name, ok)
+		}
+
+		// Every reference SKILL.md points at must ship with it, and every shipped file must be pointed at
+		mentioned := map[string]bool{}
+		for _, ref := range regexp.MustCompile(`references/[a-z0-9-]+\.md`).FindAllString(skill.Body, -1) {
+			mentioned[ref] = true
+			if _, err := readAgentSkillResource(name, ref); err != nil {
+				t.Errorf("%s points at %s: %s", name, ref, err)
+			}
+		}
+		for _, resource := range skill.Resources {
+			if !mentioned[resource] {
+				t.Errorf("%s ships %s but SKILL.md never tells the agent about it", name, resource)
+			}
+		}
+	}
+
+	// Every template name the agent node used before skills still picks the same instructions
+	for template, want := range map[string]string{
+		"workflow-builder": "workflow-builder", "edit-workflow": "workflow-builder", "build-workflows": "workflow-builder", "workflow-edit": "workflow-builder", "Edit-Workflow ": "workflow-builder",
+		"incident-handler": "incident-handler", "incident-response": "incident-handler",
+		"vulnerability": "vulnerability-management", "vulnerability-management": "vulnerability-management", "vulnerability-agent": "vulnerability-management",
+		"computer-use": "computer-use", "host-monitor-control": "computer-use",
+	} {
+		skill, ok := agentSkillForTemplate(template)
+		if !ok || skill.Name != want {
+			t.Errorf("template %q: got %q, want %q", template, skill.Name, want)
+		}
+		if isWorkflowBuilderTemplate(template) != (want == "workflow-builder") {
+			t.Errorf("isWorkflowBuilderTemplate(%q) is wrong", template)
+		}
+	}
+	for _, template := range []string{"", "default", "unknown"} {
+		if _, ok := agentSkillForTemplate(template); ok {
+			t.Errorf("template %q must not pick a skill", template)
+		}
+		if rule, _, _, _ := getTemplateContext(context.Background(), template, WorkflowExecution{}); len(rule) > 0 {
+			t.Errorf("template %q must not add a system rule", template)
+		}
+	}
+
+	// All builder aliases drop the generic prompt parts, not only edit-workflow
+	if removals := getWorkflowEditPromptRemovals(); len(removals) > 0 {
+		for _, template := range []string{"workflow-builder", "build-workflows"} {
+			if strings.Contains(filterSystemPromptByTemplate(template, "x"+removals[0]+"y"), removals[0]) {
+				t.Errorf("%s keeps the generic prompt parts", template)
+			}
+		}
+	}
+
+	// The builder's core rules carry the reference syntax the agent got wrong
+	builder := skills["workflow-builder"].Body
+	for _, rule := range []string{"PLAN FIRST", ".#0", "under .body", "$<label>.message", "get_search_actions", "get_skill_resource", "get_workflow_issues", `"tool": "shuffle_workflows_builder"`} {
+		if !strings.Contains(builder, rule) {
+			t.Errorf("builder skill is missing %q", rule)
+		}
+	}
+	if strings.Contains(builder, `"tool": "put_agent_update"`) || strings.Contains(builder, "$jira_action_1.id") {
+		t.Error("builder skill still has the old misleading examples")
+	}
+
+	// Only shipped files are served
+	for _, bad := range []string{"../workflow-builder/SKILL.md", "SKILL.md", "/etc/passwd", "references/../../incident-handler/SKILL.md", "references/missing.md"} {
+		if _, err := readAgentSkillResource("workflow-builder", bad); err == nil {
+			t.Errorf("must not serve %q", bad)
+		}
+	}
+	if content, err := readAgentSkillResource("Workflow-Builder", "/references/operations.md"); err != nil || !strings.Contains(content, `"op": "add_branch"`) {
+		t.Errorf("operations reference: %v", err)
+	}
+}
+
+// ---- Agent history size ----
+
+func TestAgentHistoryShrink(t *testing.T) {
+	// A 200k-character API result keeps its keys and first items, within budget
+	messages := []interface{}{}
+	for index := 0; index < 500; index++ {
+		messages = append(messages, map[string]interface{}{"id": fmt.Sprintf("msg-%d", index), "snippet": strings.Repeat("signup row ", 40)})
+	}
+	big, _ := json.Marshal(map[string]interface{}{"status": 200, "body": map[string]interface{}{"messages": messages, "resultSizeEstimate": 500}})
+	shrunk := shrinkAgentHistoryText(string(big), agentHistoryRecentBudget)
+	if len(shrunk) > agentHistoryRecentBudget+200 || !strings.Contains(shrunk, `"resultSizeEstimate":500`) || !strings.Contains(shrunk, "msg-0") || !strings.Contains(shrunk, "more items") || !strings.Contains(shrunk, "shortened for history") {
+		t.Errorf("shrunk result (%d chars): %.300s", len(shrunk), shrunk)
+	}
+	if small := `{"status": 200, "body": {"id": "1"}}`; shrinkAgentHistoryText(small, 100) != small {
+		t.Error("a result within budget must stay as it is")
+	}
+	if text := shrinkAgentHistoryText(strings.Repeat("<p>html</p>", 1000), 500); len(text) > 650 || !strings.Contains(text, "shortened for history") {
+		t.Errorf("non-JSON text must be cut to budget: %d", len(text))
+	}
+
+	longBody := strings.Repeat("x", 5000)
+	decisions := []AgentDecision{
+		{Action: "get_gmail_users_messages_get", Fields: []Valuereplace{{Key: "body", Value: longBody}}, RunDetails: AgentDecisionRunDetails{RawResponse: string(big)}},
+		{Action: "get_skill_resource", RunDetails: AgentDecisionRunDetails{RawResponse: string(big)}},
+		{Action: "a"}, {Action: "b"},
+		{Action: "get_minimal_workflow", RunDetails: AgentDecisionRunDetails{RawResponse: string(big)}},
+	}
+	stored := decisions[0].Fields
+	out := shrinkAgentHistoryDecisions(append([]AgentDecision{}, decisions...))
+	if len(out[0].RunDetails.RawResponse) > agentHistoryOlderBudget+200 || len(out[0].Fields[0].Value) > agentHistoryFieldBudget+200 {
+		t.Errorf("old decision not shrunk: %d / %d", len(out[0].RunDetails.RawResponse), len(out[0].Fields[0].Value))
+	}
+	if stored[0].Value != longBody {
+		t.Error("shrinking the prompt copy changed the stored decision's fields")
+	}
+	if out[1].RunDetails.RawResponse != string(big) {
+		t.Error("skill files must stay whole")
+	}
+	if got := len(out[4].RunDetails.RawResponse); got <= agentHistoryOlderBudget+200 || got > agentHistoryRecentBudget+200 {
+		t.Errorf("recent decision should get the recent budget, got %d", got)
+	}
+}
+
+// Agent self-posts stay on this machine locally, and keep the configured URL elsewhere
+func TestAgentSelfUrl(t *testing.T) {
+	t.Setenv("SHUFFLE_CLOUDRUN_URL", "https://tunnel.example")
+	t.Setenv("BASE_URL", "http://localhost:5002/")
+	if got := getAgentSelfUrl(); got != "http://localhost:5002" {
+		t.Errorf("local: %s", got)
+	}
+	t.Setenv("BASE_URL", "https://shuffler.io")
+	if got := getAgentSelfUrl(); got != "https://tunnel.example" {
+		t.Errorf("hosted: %s", got)
 	}
 }

@@ -2117,6 +2117,11 @@ func GetGeminiCredentials(ctx context.Context) (string, string, string) {
 	}
 
 	location := os.Getenv("SHUFFLE_GCE_LOCATION")
+	// AI-only override, e.g. "global" for Claude. SHUFFLE_GCE_LOCATION is shared with tasks/storage
+	if len(os.Getenv("AI_VERTEX_LOCATION")) > 0 {
+		location = os.Getenv("AI_VERTEX_LOCATION")
+	}
+
 	if len(projectID) == 0 || len(location) == 0 {
 		return "", "", foundModel
 	}

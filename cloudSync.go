@@ -2295,6 +2295,19 @@ func HandleSuborgScheduleRun(request *http.Request, workflow *Workflow) {
 	}
 }
 
+// The agent posts each decision result to its own backend's /api/v1/streams. Locally SHUFFLE_CLOUDRUN_URL
+// is a public tunnel (so apps can reach the backend), and going out and back through it made every
+// agent step wait on the tunnel: minutes of timeouts, then a duplicate in-process delivery.
+// When BASE_URL is this machine, use it for those calls to itself.
+func getAgentSelfUrl() string {
+	baseUrl := strings.TrimRight(os.Getenv("BASE_URL"), "/")
+	if strings.HasPrefix(baseUrl, "http://localhost") || strings.HasPrefix(baseUrl, "http://127.0.0.1") {
+		return baseUrl
+	}
+
+	return getBackendBaseUrl()
+}
+
 func getBackendBaseUrl() string {
 	backendUrl := ""
 	if len(os.Getenv("BASE_URL")) > 0 {
@@ -2503,6 +2516,11 @@ func runAgentDecisionDirectAppCall(execution WorkflowExecution, decision AgentDe
 
 	// Overlay values the agent has explicitly provided, matching by parameter name.
 	for _, field := range decision.Fields {
+		// The user's approval note, not an app parameter
+		if field.Key == "approve" {
+			continue
+		}
+
 		val := field.Value
 		if len(field.Answer) > 0 {
 			val = field.Answer
@@ -2525,6 +2543,54 @@ func runAgentDecisionDirectAppCall(execution WorkflowExecution, decision AgentDe
 		}
 	}
 
+
+	// OpenAPI apps: send the spec's headers with resolved defaults (e.g. Notion-Version), the agent's own
+	// headers text, and any header the agent set by name. Without this, unfilled spec placeholders are sent.
+	if resolvedApp.Generated {
+		if entry := findCatalogEntry(getAppActionCatalog(ctx, resolvedApp), action.Name); entry != nil && len(entry.Headers) > 0 {
+			agentText := ""
+			for _, field := range decision.Fields {
+				if strings.EqualFold(field.Key, "headers") {
+					agentText = field.Value
+				}
+			}
+
+			agentNamed := map[string]string{}
+			storedValue := ""
+			kept := []WorkflowAppActionParameter{}
+			headersIndex := -1
+			for _, param := range action.Parameters {
+				isHeader := false
+				for _, header := range entry.Headers {
+					if catalogKey(header.Name) == catalogKey(param.Name) {
+						if len(strings.TrimSpace(param.Value)) > 0 {
+							agentNamed[header.Name] = strings.TrimSpace(param.Value)
+						}
+						isHeader = true
+						break
+					}
+				}
+				if isHeader {
+					continue
+				}
+				if strings.EqualFold(param.Name, "headers") {
+					if len(agentText) == 0 {
+						storedValue = param.Value
+					}
+					headersIndex = len(kept)
+				}
+				kept = append(kept, param)
+			}
+
+			headersValue := composeCatalogHeaders(entry, storedValue, agentText, agentNamed)
+			if headersIndex >= 0 {
+				kept[headersIndex].Value = headersValue
+			} else {
+				kept = append(kept, WorkflowAppActionParameter{Name: "headers", Value: headersValue})
+			}
+			action.Parameters = kept
+		}
+	}
 
 	// Signal HandleRetValidation to skip the 30-second polling timeout.
 	action.Parameters = append(action.Parameters, WorkflowAppActionParameter{
@@ -2599,6 +2665,12 @@ func runAgentDecisionDirectAppCall(execution WorkflowExecution, decision AgentDe
 		//	log.Printf("[ERROR][%s] DirectAppCall: HTTP call failed: %s", execution.ExecutionId, doErr)
 		//}
 
+		// A timeout usually means the app ran but its result went to another backend (the cloud function
+		// callback URL). Say so, so the agent doesn't retry blindly and the user knows what to check.
+		if errors.Is(doErr, context.DeadlineExceeded) || strings.Contains(doErr.Error(), "Client.Timeout") {
+			return nil, "", resolvedAppName, nil, action.Name, fmt.Errorf("No result came back from the %s app within %s. The app may have run, but its result was not delivered to this backend (%s). Retrying will not help until that is fixed: for local backends, set SHUFFLE_CLOUDRUN_URL to a public URL (e.g. ngrok) for this backend. Raw error: %s", resolvedAppName, timeout, baseURL, doErr)
+		}
+
 		return nil, "", resolvedAppName, nil, action.Name, doErr
 	}
 
@@ -2614,8 +2686,18 @@ func runAgentDecisionDirectAppCall(execution WorkflowExecution, decision AgentDe
 
 	debugUrl = resp.Header.Get("X-Debug-Url")
 	if resp.StatusCode >= 400 {
-		log.Printf("[ERROR][%s] DirectAppCall: executeSingleAction returned HTTP %d: %s", execution.ExecutionId, resp.StatusCode, string(respBody))
-		return nil, debugUrl, resolvedAppName, nil, action.Name, fmt.Errorf("DirectAppCall: executeSingleAction returned HTTP %d", resp.StatusCode)
+		log.Printf("[ERROR][%s] DirectAppCall: %s returned HTTP %d: %s", execution.ExecutionId, baseURL, resp.StatusCode, string(respBody))
+
+		// The agent and the user only see this error, so say where it came from and what it means
+		body := strings.TrimSpace(string(respBody))
+		if len(body) > 500 {
+			body = body[:500] + "..."
+		}
+		reason := fmt.Sprintf("Shuffle backend %s returned HTTP %d before the %s app was called: %s", baseURL, resp.StatusCode, resolvedAppName, body)
+		if strings.Contains(body, "execution mapping") || strings.Contains(body, "doesn't exist") {
+			reason += fmt.Sprintf(". That backend could not find this agent run, so this is NOT a %s credentials problem. Check that BASE_URL points to the backend running this agent.", resolvedAppName)
+		}
+		return nil, debugUrl, resolvedAppName, nil, action.Name, errors.New(reason)
 	}
 
 	var singleResult SingleResult
@@ -2705,6 +2787,11 @@ func RunAgentDecisionSingulActionHandler(execution WorkflowExecution, decision A
 
 	newFields := []schemaless.Valuereplace{}
 	for _, field := range decision.Fields {
+		// The user's approval note, not an app parameter
+		if field.Key == "approve" {
+			continue
+		}
+
 		newFields = append(newFields, schemaless.Valuereplace{
 			Key:   field.Key,
 			Value: field.Value,
@@ -2995,7 +3082,127 @@ func isAgentToolAllowed(agentOutput AgentOutput, decision AgentDecision) (bool, 
 		}
 	}
 
+	// Builder runs: apps found by the app lookup earlier in this run can be called
+	// with the user's saved auth, to look at real data and test nodes.
+	if isToolReadyFromBuilderLookup(agentOutput, decision.Tool) {
+		return true, nil
+	}
+
 	return false, allowedTools
+}
+
+// The approve handler (agentic answers in shared.go) appends this field when the user approves
+func isAgentDecisionApproved(decision AgentDecision) bool {
+	for _, field := range decision.Fields {
+		if field.Key == "approve" && strings.HasPrefix(field.Value, "Approved to continue") {
+			return true
+		}
+	}
+	return false
+}
+
+// True if an app lookup (search_actions or get_action) in this builder run returned the
+// tool as authenticated, or as needing no authentication.
+func isToolReadyFromBuilderLookup(agentOutput AgentOutput, tool string) bool {
+	if !isWorkflowBuilderTemplate(agentOutput.Template) {
+		return false
+	}
+
+	wanted := normalizeAgentToolName(tool)
+	if len(wanted) == 0 {
+		return false
+	}
+
+	for _, app := range getBuilderLookupReadyApps(agentOutput.Decisions) {
+		if normalizeAgentToolName(app.AppName) == wanted || strings.EqualFold(app.AppID, wanted) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// Apps the app lookups in these decisions returned as ready to call: authenticated, or needing no auth
+func getBuilderLookupReadyApps(decisions []AgentDecision) []AppActionResponse {
+	ready := []AppActionResponse{}
+	seen := map[string]bool{}
+	add := func(app AppActionResponse) {
+		if len(app.AppID) == 0 || seen[app.AppID] || !(app.Authenticated || !app.AuthenticationRequired) {
+			return
+		}
+		seen[app.AppID] = true
+		ready = append(ready, app)
+	}
+
+	for _, previous := range decisions {
+		action := normalizeToolName(previous.Action)
+		if len(previous.RunDetails.RawResponse) == 0 {
+			continue
+		}
+
+		switch {
+		// Catalog responses: search_actions rows and get_action entries carry app, app_id and ready
+		case strings.Contains(action, "searchactions") || strings.Contains(action, "searchappactions"):
+			wrapped := struct {
+				Body struct {
+					Results []CatalogSearchHit `json:"results"`
+				} `json:"body"`
+			}{}
+			if json.Unmarshal([]byte(previous.RunDetails.RawResponse), &wrapped) != nil {
+				continue
+			}
+			for _, hit := range wrapped.Body.Results {
+				if hit.Ready {
+					add(AppActionResponse{AppName: hit.AppName, AppID: hit.AppID, Authenticated: true, AuthenticationRequired: true})
+				}
+			}
+
+		case action == "getaction" || action == "getappaction":
+			wrapped := struct {
+				Body struct {
+					Entry CatalogActionEntry `json:"entry"`
+					Ready bool               `json:"ready"`
+				} `json:"body"`
+			}{}
+			if json.Unmarshal([]byte(previous.RunDetails.RawResponse), &wrapped) == nil && wrapped.Body.Ready {
+				add(AppActionResponse{AppName: wrapped.Body.Entry.AppName, AppID: wrapped.Body.Entry.AppID, Authenticated: true, AuthenticationRequired: true})
+			}
+		}
+	}
+
+	return ready
+}
+
+// A builder chat that creates a workflow becomes part of it: the workflow ID goes in the run's
+// execution_argument, which the editor's chat history groups by and later turns build on.
+func linkBuilderRunToCreatedWorkflow(ctx context.Context, executionId string, rawResponse string) {
+	parsed := struct {
+		Body struct {
+			WorkflowId string `json:"workflow_id"`
+			Id         string `json:"id"`
+		} `json:"body"`
+	}{}
+	if err := json.Unmarshal([]byte(rawResponse), &parsed); err != nil {
+		return
+	}
+
+	workflowId := parsed.Body.WorkflowId
+	if len(workflowId) == 0 {
+		workflowId = parsed.Body.Id
+	}
+	if len(workflowId) != 36 {
+		return
+	}
+
+	exec, err := GetWorkflowExecution(ctx, executionId)
+	if err != nil || exec == nil || len(exec.ExecutionArgument) > 0 {
+		return
+	}
+
+	exec.ExecutionArgument = workflowId
+	if err := SetWorkflowExecution(ctx, *exec, true); err != nil {
+		log.Printf("[WARNING][%s] AI Agent: failed linking chat to created workflow %s: %s", executionId, workflowId, err)
+	}
 }
 
 // Runs an Agent Decision -> returns the result from it
@@ -3028,7 +3235,9 @@ func RunAgentDecisionAction(execution WorkflowExecution, agentOutput AgentOutput
 			log.Printf("[WARNING][%s] Failed agent decision unmarshal (not critical): %s", execution.ExecutionId, err)
 		}
 
-		if foundDecision.RunDetails.StartedAt > 0 {
+		// A decision held for approval (status WAITING) runs again once the user approves it
+		heldThenApproved := foundDecision.RunDetails.Status == "WAITING" && isAgentDecisionApproved(decision)
+		if foundDecision.RunDetails.StartedAt > 0 && !heldThenApproved {
 			log.Printf("[DEBUG][%s] Decision %s already has status '%s'. Returning as it's already started..", execution.ExecutionId, decision.RunDetails.Id, foundDecision.RunDetails.Status)
 			return
 		}
@@ -3064,6 +3273,16 @@ func RunAgentDecisionAction(execution WorkflowExecution, agentOutput AgentOutput
 			if debug {
 				log.Printf("[WARNING][%s] AI Agent blocked disallowed tool '%s' for decision %s. Allowed tools: %s", execution.ExecutionId, decision.Tool, decision.RunDetails.Id, strings.Join(allowedTools, ", "))
 			}
+		} else if addedNodes := countBuilderActionNodesAdded(decision); isWorkflowBuilderTemplate(agentOutput.Template) && addedNodes > 1 {
+			// Builder runs: one action node per update, so each node is tested on real data before the next is built
+			decision.RunDetails.Status = "FAILURE"
+			decision.RunDetails.RawResponse = fmt.Sprintf(`{"success": false, "reason": "Nothing was changed. This update adds %d action nodes; add ONE action node per put_agent_update (its branch and set_start_node can go with it). Then test that node by calling its app action with the same parameters on real data, and build the next node from that output. Triggers don't count towards the limit."}`, addedNodes)
+		} else if isWorkflowBuilderTemplate(agentOutput.Template) && decision.Category == "singul" && builderDecisionNeedsApproval(decision) && !isAgentDecisionApproved(decision) {
+			// Builder runs: calls that can change data wait for the user's approval in the agent UI.
+			// Covers decisions started from handleAgentDecisionStreamResult, which skip the check in ai.go.
+			log.Printf("[INFO][%s] AI Agent: holding decision %s (%s / %s) for user approval", execution.ExecutionId, decision.RunDetails.Id, decision.Tool, decision.Action)
+			decision.ApprovalRequired = true
+			decision.RunDetails.Status = "WAITING"
 		} else {
 			// Singul handler
 			if debug {
@@ -3118,6 +3337,10 @@ func RunAgentDecisionAction(execution WorkflowExecution, agentOutput AgentOutput
 				}
 			} else {
 				decision.RunDetails.Status = "FINISHED"
+
+				if isWorkflowBuilderTemplate(agentOutput.Template) && strings.Contains(strings.ToLower(decision.Action), "create_workflow") {
+					linkBuilderRunToCreatedWorkflow(ctx, execution.ExecutionId, decision.RunDetails.RawResponse)
+				}
 			}
 		}
 
@@ -3163,7 +3386,7 @@ func RunAgentDecisionAction(execution WorkflowExecution, agentOutput AgentOutput
 	//     2. Send the result through AI again to check if it changes (?). Should there be a verdict here?
 	//     3: Start the next steps of decisions after updates
 
-	baseUrl := getBackendBaseUrl()
+	baseUrl := getAgentSelfUrl()
 
 	//url := fmt.Sprintf("%s/api/v1/apps/categories/run?authorization=%s&execution_id=%s", baseUrl, execution.Authorization, execution.ExecutionId)
 	url := fmt.Sprintf("%s/api/v1/streams", baseUrl)

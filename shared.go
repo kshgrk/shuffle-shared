@@ -1,6 +1,7 @@
 package shuffle
 
 import (
+	"math"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -20066,7 +20067,7 @@ func sendAgentActionSelfRequest(status string, workflowExecution WorkflowExecuti
 	}
 	actionResult.CompletedAt = timenow
 
-	baseUrl := getBackendBaseUrl()
+	baseUrl := getAgentSelfUrl()
 
 	marshalledResult, err := json.Marshal(actionResult)
 	if err != nil {
@@ -20451,6 +20452,10 @@ func handleAgentDecisionStreamResult(workflowExecution WorkflowExecution, action
 			continue
 		}
 
+		if !shouldStartChainedDecision(curDecision) {
+			continue
+		}
+
 		foundDecisions := []AgentDecision{}
 		parentIndex := curDecision.I - 1
 		for _, subDecision := range mappedResult.Decisions {
@@ -20542,12 +20547,44 @@ func handleAgentDecisionStreamResult(workflowExecution WorkflowExecution, action
 		}
 
 		lockKey := fmt.Sprintf("agent_llm_lock_%s_%s", workflowExecution.ExecutionId, originalAction.ID)
+		// A result can land while the previous turn still holds the lock (a fast in-process tool finishes
+		// before that turn returns). Dropping it leaves the agent waiting forever, so it is parked here and
+		// the lock holder hands it back in once it releases the lock.
+		pendingKey := fmt.Sprintf("agent_llm_pending_%s_%s", workflowExecution.ExecutionId, originalAction.ID)
 		if _, err := GetCache(ctx, lockKey); err == nil {
-			log.Printf("[INFO][%s] LLM re-entry lock held in cache, skipping duplicate call for node %s", workflowExecution.ExecutionId, originalAction.ID)
+			log.Printf("[INFO][%s] LLM re-entry lock held in cache, parking result for node %s until the lock is released", workflowExecution.ExecutionId, originalAction.ID)
+			if marshalledPending, err := json.Marshal(actionResult); err == nil {
+				_ = SetCache(ctx, pendingKey, marshalledPending, 10)
+			}
 			return &workflowExecution, false, nil
 		}
 		_ = SetCache(ctx, lockKey, []byte("1"), 2)
-		defer DeleteCache(ctx, lockKey)
+		defer func() {
+			DeleteCache(ctx, lockKey)
+			pending, err := GetCache(ctx, pendingKey)
+			if err != nil {
+				return
+			}
+			DeleteCache(ctx, pendingKey)
+
+			pendingResult := ActionResult{}
+			pendingBytes, ok := pending.([]uint8)
+			if !ok || json.Unmarshal(pendingBytes, &pendingResult) != nil {
+				return
+			}
+
+			log.Printf("[INFO][%s] Handling result parked while the LLM lock was held (%s)", workflowExecution.ExecutionId, pendingResult.Status)
+			go func() {
+				freshExec, err := GetWorkflowExecution(context.Background(), workflowExecution.ExecutionId)
+				if err != nil {
+					log.Printf("[ERROR][%s] Failed loading execution for parked result: %s", workflowExecution.ExecutionId, err)
+					return
+				}
+				if _, _, err := handleAgentDecisionStreamResult(*freshExec, pendingResult); err != nil {
+					log.Printf("[ERROR][%s] Failed handling parked result: %s", workflowExecution.ExecutionId, err)
+				}
+			}()
+		}()
 
 		// If the execution is already FINISHED but a continuation was injected (user asked the agent to do more on top of what it already did), we need to reset the status back to EXECUTING so that HandleAiAgentExecutionStart doesn't exit with "Agent run already finished".
 		if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "SUCCESS" {
@@ -20975,7 +21012,7 @@ func ParsedExecutionResult(ctx context.Context, workflowExecution WorkflowExecut
 										log.Printf("[ERROR][%s] Failed to marshal updated decision for delayed decision update: %s", workflowExecution.ExecutionId, err)
 									}
 
-									baseUrl := getBackendBaseUrl()
+									baseUrl := getAgentSelfUrl()
 
 									url := fmt.Sprintf("%s/api/v1/streams", baseUrl)
 									if debug { 
@@ -27888,6 +27925,8 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 
 					cleanupFailures := false
 					fieldsChanged := false
+					// An approved decision still has to run; it's started below instead of being marked done
+					approvedToRun := false
 
 					lastIndex := -1
 					decisionIndex := -1
@@ -27926,8 +27965,12 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 
 								if value == "true" {
 									unmarshalledDecision.Status = "RUNNING"
+									approvedToRun = true
 
 									decision.RunDetails.Status = "RUNNING"
+									// The 5 minute decision timeout counts from StartedAt, and time spent waiting for the
+									// user's approval is not run time. Without this, approving after 5 minutes fails it instantly.
+									decision.RunDetails.StartedAt = time.Now().UnixMilli()
 									decision.Fields = append(decision.Fields, Valuereplace{
 										Key:   "approve",
 										Value: fmt.Sprintf("Approved to continue at %s", time.Now().Format(time.RFC1123)),
@@ -28069,7 +28112,10 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 						fieldsChanged = true
 					}
 
-					if fieldsChanged && decisionIndex >= 0 {
+					if fieldsChanged && decisionIndex >= 0 && approvedToRun {
+						// Keep it RUNNING and out of the decision cache, so RunAgentDecisionAction runs it below
+						unmarshalledDecision.Decisions[decisionIndex] = selectedDecision
+					} else if fieldsChanged && decisionIndex >= 0 {
 						selectedDecision.RunDetails.Status = "FINISHED"
 						selectedDecision.RunDetails.CompletedAt = time.Now().UnixMilli()
 						unmarshalledDecision.Decisions[decisionIndex] = selectedDecision
@@ -28146,6 +28192,13 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 					newExec, _, err := handleAgentDecisionStreamResult(*oldExecution, result)
 					if err != nil {
 						log.Printf("[ERROR][%s] Failed handling agentic decision result: %s", oldExecution.ExecutionId, err)
+					}
+
+					// Approved: run the action now. Its result comes back through the stream like any other decision,
+					// and the agent continues from the real output.
+					if approvedToRun && decisionIndex >= 0 {
+						log.Printf("[INFO][%s] Running approved decision %s (%s / %s)", oldExecution.ExecutionId, selectedDecision.RunDetails.Id, selectedDecision.Tool, selectedDecision.Action)
+						go RunAgentDecisionAction(*oldExecution, unmarshalledDecision, selectedDecision)
 					}
 
 					return *newExec, ExecInfo{}, fmt.Sprintf("Agentic question handled (%s)", oldExecution.ExecutionId), errors.New("User Input: Agentic question action handled successfully!")
@@ -29584,7 +29637,8 @@ func PrepareWorkflowExecution(ctx context.Context, workflow Workflow, request *h
 
 		found = false
 		for _, env := range environments {
-			if env == action.Environment {
+			// "Cloud" and "cloud" are the same env; counting both made len != 1 and the run was never queued
+			if strings.EqualFold(env, action.Environment) {
 				found = true
 				break
 			}
@@ -39324,99 +39378,7 @@ func GetWorkflowAppActions(resp http.ResponseWriter, request *http.Request) {
 	}
 
 	// Find matching apps based on provided names or IDs
-	matchedApps := []WorkflowApp{}
-
-	// Search by IDs first (more direct)
-	if len(actionReq.AppIDs) > 0 {
-		for _, appID := range actionReq.AppIDs {
-			foundInOrg := false
-			for _, app := range allApps {
-				if app.ID == appID && len(app.Name) > 0 {
-					if debug {
-						log.Printf("[DEBUG] Found app by ID %s in org apps list", appID)
-					}
-					matchedApps = append(matchedApps, app)
-					foundInOrg = true
-					break
-				}
-			}
-
-			// If not found in org's active apps, fetch it globally by ID!
-			if !foundInOrg {
-				if debug {
-					log.Printf("[DEBUG] App ID %s not in org, trying global GetApp", appID)
-				}
-				globalApp, err := GetApp(ctx, appID, user, false)
-				if err == nil && globalApp != nil {
-					if debug {
-						log.Printf("[DEBUG] Successfully found app %s globally", appID)
-					}
-					matchedApps = append(matchedApps, *globalApp)
-				} else {
-					if debug {
-						log.Printf("[DEBUG] Failed to fetch app globally by ID %s: %v", appID, err)
-					}
-				}
-			}
-		}
-	}
-
-	// Search by names (case-insensitive)
-	if len(actionReq.AppNames) > 0 {
-		for _, appName := range actionReq.AppNames {
-			lowerName := strings.ToLower(strings.TrimSpace(appName))
-			foundInOrg := false
-			for _, app := range allApps {
-				if normalizeToolName(app.Name) == normalizeToolName(lowerName) && len(app.ID) > 0 {
-					if debug {
-						log.Printf("[DEBUG] Found app by name '%s' (ID %s) in org apps list", appName, app.ID)
-					}
-					// Check if already added via ID search
-					alreadyAdded := false
-					for _, matched := range matchedApps {
-						if matched.ID == app.ID {
-							alreadyAdded = true
-							break
-						}
-					}
-					if !alreadyAdded {
-						matchedApps = append(matchedApps, app)
-					}
-					foundInOrg = true
-					break
-				}
-			}
-
-			// If not found in org, search Algolia
-			if !foundInOrg {
-				if debug {
-					log.Printf("[DEBUG] App Name '%s' not in org, searching Algolia", appName)
-				}
-				algoliaApp, err := HandleAlgoliaAppSearch(ctx, appName)
-				if err == nil && algoliaApp.ObjectID != "" {
-					if debug {
-						log.Printf("[DEBUG] Found Algolia match for '%s': ObjectID %s", appName, algoliaApp.ObjectID)
-					}
-					discoveredApp, err := GetApp(ctx, algoliaApp.ObjectID, user, false)
-					if err == nil && discoveredApp != nil {
-						alreadyAdded := false
-						for _, matched := range matchedApps {
-							if matched.ID == discoveredApp.ID {
-								alreadyAdded = true
-								break
-							}
-						}
-						if !alreadyAdded {
-							if debug {
-								log.Printf("[DEBUG] Appended Algolia app %s to matched apps", discoveredApp.ID)
-							}
-							matchedApps = append(matchedApps, *discoveredApp)
-						}
-					}
-				}
-			}
-		}
-	}
+	matchedApps := resolveAgentApps(ctx, user, allApps, actionReq.AppNames, actionReq.AppIDs)
 
 	if len(matchedApps) == 0 {
 		if debug {
@@ -39489,6 +39451,1055 @@ func GetWorkflowAppActions(resp http.ResponseWriter, request *http.Request) {
 	resp.Header().Set("Content-Type", "application/json")
 	resp.WriteHeader(200)
 	resp.Write(responseData)
+}
+
+
+// Resolves app names or IDs to apps: the org's apps first, then any app by ID, then a public search by name.
+// Shared by the app action lookup and the action catalog.
+func resolveAgentApps(ctx context.Context, user User, allApps []WorkflowApp, appNames, appIDs []string) []WorkflowApp {
+	matchedApps := []WorkflowApp{}
+
+	// Search by IDs first (more direct)
+	if len(appIDs) > 0 {
+		for _, appID := range appIDs {
+			foundInOrg := false
+			for _, app := range allApps {
+				if app.ID == appID && len(app.Name) > 0 {
+					if debug {
+						log.Printf("[DEBUG] Found app by ID %s in org apps list", appID)
+					}
+					matchedApps = append(matchedApps, app)
+					foundInOrg = true
+					break
+				}
+			}
+
+			// If not found in org's active apps, fetch it globally by ID!
+			if !foundInOrg {
+				if debug {
+					log.Printf("[DEBUG] App ID %s not in org, trying global GetApp", appID)
+				}
+				globalApp, err := GetApp(ctx, appID, user, false)
+				if err == nil && globalApp != nil {
+					if debug {
+						log.Printf("[DEBUG] Successfully found app %s globally", appID)
+					}
+					matchedApps = append(matchedApps, *globalApp)
+				} else {
+					if debug {
+						log.Printf("[DEBUG] Failed to fetch app globally by ID %s: %v", appID, err)
+					}
+				}
+			}
+		}
+	}
+
+	// Search by names (case-insensitive)
+	if len(appNames) > 0 {
+		for _, appName := range appNames {
+			lowerName := strings.ToLower(strings.TrimSpace(appName))
+			foundInOrg := false
+			for _, app := range allApps {
+				if normalizeToolName(app.Name) == normalizeToolName(lowerName) && len(app.ID) > 0 {
+					if debug {
+						log.Printf("[DEBUG] Found app by name '%s' (ID %s) in org apps list", appName, app.ID)
+					}
+					// Check if already added via ID search
+					alreadyAdded := false
+					for _, matched := range matchedApps {
+						if matched.ID == app.ID {
+							alreadyAdded = true
+							break
+						}
+					}
+					if !alreadyAdded {
+						matchedApps = append(matchedApps, app)
+					}
+					foundInOrg = true
+					break
+				}
+			}
+
+			// If not found in org, search Algolia
+			if !foundInOrg {
+				if debug {
+					log.Printf("[DEBUG] App Name '%s' not in org, searching Algolia", appName)
+				}
+				algoliaApp, err := HandleAlgoliaAppSearch(ctx, appName)
+				if err == nil && algoliaApp.ObjectID != "" {
+					if debug {
+						log.Printf("[DEBUG] Found Algolia match for '%s': ObjectID %s", appName, algoliaApp.ObjectID)
+					}
+					discoveredApp, err := GetApp(ctx, algoliaApp.ObjectID, user, false)
+					if err == nil && discoveredApp != nil {
+						alreadyAdded := false
+						for _, matched := range matchedApps {
+							if matched.ID == discoveredApp.ID {
+								alreadyAdded = true
+								break
+							}
+						}
+						if !alreadyAdded {
+							if debug {
+								log.Printf("[DEBUG] Appended Algolia app %s to matched apps", discoveredApp.ID)
+							}
+							matchedApps = append(matchedApps, *discoveredApp)
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return matchedApps
+}
+
+
+// ---- App action catalog: lets agents search app actions and read one action's real schema ----
+// Entries are derived per app from its stored OpenAPI spec (openapi3) and its generated actions
+// (workflowapp), then cached in memory by app version. Nothing extra is stored.
+
+type CatalogActionParam struct {
+	Name        string   `json:"name"`
+	In          string   `json:"in,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	Required    bool     `json:"required,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Enum        []string `json:"enum,omitempty"`
+	Default     string   `json:"default,omitempty"`
+	Example     string   `json:"example,omitempty"`
+	NeedsValue  bool     `json:"needs_value,omitempty"`
+}
+
+type CatalogActionEntry struct {
+	AppID              string               `json:"app_id"`
+	AppName            string               `json:"app"`
+	AppVersion         string               `json:"app_version,omitempty"`
+	Categories         []string             `json:"categories,omitempty"`
+	Action             string               `json:"action"`
+	Label              string               `json:"label,omitempty"`
+	Summary            string               `json:"summary,omitempty"`
+	Method             string               `json:"method,omitempty"`
+	Path               string               `json:"path,omitempty"`
+	Params             []CatalogActionParam `json:"params"`
+	Headers            []CatalogActionParam `json:"headers,omitempty"`
+	BodyExample        string               `json:"body_example,omitempty"`
+	BodyRequiredFields []string             `json:"body_required_fields,omitempty"`
+	Safety             string               `json:"safety"`
+	SafetySource       string               `json:"safety_source"`
+	ApprovalMode       string               `json:"approval_mode"`
+	SearchText         string               `json:"search_text,omitempty"`
+}
+
+// Filled by credentials or by the call layer, never by the agent
+var catalogHiddenParams = map[string]bool{
+	"apikey": true, "api_key": true, "url": true, "access_token": true, "username_basic": true,
+	"password_basic": true, "ssl_verify": true, "to_file": true, "headers": true, "queries": true,
+	"authorization": true,
+}
+
+// Values for spec placeholders like {{NOTION_VERSION}} that would otherwise be sent as-is
+var catalogPlaceholderValues = map[string]string{
+	"NOTION_VERSION": "2026-03-11",
+}
+
+// Reviewed safety, keyed by app:action (both lowercased alphanumerics). Wins over method/name guesses.
+var catalogReviewedSafety = map[string]string{
+	"notion:postsearch":           "read",
+	"notion:postfilteradatabase":  "read",
+	"notion:postqueryadatabase":   "read",
+	"notion:postretrievecomments": "read",
+}
+
+var catalogPlaceholderPattern = regexp.MustCompile(`^\s*(\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}|<[^>]+>|\$\{?([A-Za-z0-9_]+)\}?)\s*$`)
+var catalogGeneratedPattern = regexp.MustCompile(`(?i)generated by shuffler\.io( openapi)?`)
+var catalogSecretPattern = regexp.MustCompile(`(?i)(bearer\s+\S{12,}|secret_[a-z0-9]{12,}|sk-[a-z0-9_-]{12,}|xox[abprs]-\S+|ghp_[a-z0-9]{20,}|ntn_[a-z0-9]{12,})`)
+
+var actionCatalogCache = struct {
+	sync.RWMutex
+	entries map[string][]CatalogActionEntry
+}{entries: map[string][]CatalogActionEntry{}}
+
+func catalogKey(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func catalogTruncate(value string, max int) string {
+	value = strings.TrimSpace(value)
+	if len(value) > max {
+		return value[:max] + "..."
+	}
+	return value
+}
+
+// First sentence of a Shuffle action description, without the trailing endpoint URL line
+func catalogSummary(description, fallback string) string {
+	text := strings.TrimSpace(description)
+	if idx := strings.Index(text, "\n\nhttp"); idx >= 0 {
+		text = text[:idx]
+	} else if strings.HasPrefix(text, "http") {
+		text = ""
+	}
+	text = strings.TrimSpace(strings.SplitN(text, "\n", 2)[0])
+	if idx := strings.Index(text, ". "); idx > 0 {
+		text = text[:idx+1]
+	}
+	if len(text) == 0 {
+		text = strings.TrimSpace(strings.ReplaceAll(fallback, "_", " "))
+	}
+	return catalogTruncate(text, 200)
+}
+
+// Resolves a placeholder example to a known value. needsValue is true when it is a placeholder we can't fill.
+func catalogResolveDefault(example string) (value string, needsValue bool) {
+	example = strings.TrimSpace(example)
+	if len(example) == 0 {
+		return "", false
+	}
+	match := catalogPlaceholderPattern.FindStringSubmatch(example)
+	if match == nil {
+		return example, false
+	}
+	token := match[2]
+	if len(token) == 0 {
+		token = match[3]
+	}
+	if known, ok := catalogPlaceholderValues[strings.ToUpper(token)]; ok {
+		return known, false
+	}
+	return "", true
+}
+
+type catalogSpecParam struct {
+	Name        string      `json:"name"`
+	In          string      `json:"in"`
+	Required    bool        `json:"required"`
+	Description string      `json:"description"`
+	Example     interface{} `json:"example"`
+	Schema      struct {
+		Type string        `json:"type"`
+		Enum []interface{} `json:"enum"`
+	} `json:"schema"`
+}
+
+type catalogSpecOperation struct {
+	Method      string
+	Path        string
+	Summary     string `json:"summary"`
+	OperationId string `json:"operationId"`
+	Parameters  []catalogSpecParam `json:"parameters"`
+}
+
+func parseCatalogSpec(specBody string) []catalogSpecOperation {
+	spec := struct {
+		Paths map[string]map[string]json.RawMessage `json:"paths"`
+	}{}
+	if err := json.Unmarshal([]byte(specBody), &spec); err != nil {
+		return nil
+	}
+
+	operations := []catalogSpecOperation{}
+	for path, methods := range spec.Paths {
+		for method, raw := range methods {
+			method = strings.ToLower(method)
+			if !ArrayContains([]string{"get", "post", "put", "patch", "delete", "head", "connect"}, method) {
+				continue
+			}
+			operation := catalogSpecOperation{}
+			if json.Unmarshal(raw, &operation) != nil {
+				continue
+			}
+			operation.Method = strings.ToUpper(method)
+			operation.Path = path
+			operations = append(operations, operation)
+		}
+	}
+	return operations
+}
+
+func catalogExampleString(example interface{}) string {
+	switch value := example.(type) {
+	case nil:
+		return ""
+	case string:
+		return value
+	default:
+		marshalled, _ := json.Marshal(value)
+		return string(marshalled)
+	}
+}
+
+// Matches a generated action to its spec operation: codegen names actions "<method> <summary>" and labels them "<summary>"
+func catalogMatchOperation(action WorkflowAppAction, operations []catalogSpecOperation) *catalogSpecOperation {
+	name := catalogKey(action.Name)
+	for i := range operations {
+		operation := &operations[i]
+		method := strings.ToLower(operation.Method)
+		if !strings.HasPrefix(name, method) {
+			continue
+		}
+		if catalogKey(action.Label) == catalogKey(operation.Summary) || name == method+catalogKey(operation.Summary) || name == method+catalogKey(operation.OperationId) {
+			return operation
+		}
+	}
+	return nil
+}
+
+func catalogSafety(app WorkflowApp, action WorkflowAppAction, method string) (string, string) {
+	appKey := catalogKey(app.Name)
+	for _, actionKey := range []string{catalogKey(action.Name), catalogKey(action.Label)} {
+		if safety, ok := catalogReviewedSafety[appKey+":"+actionKey]; ok {
+			return safety, "reviewed"
+		}
+	}
+
+	words := strings.Fields(strings.ToLower(strings.NewReplacer("_", " ", "-", " ", ".", " ").Replace(action.Name + " " + action.Label)))
+	hasWord := func(set ...string) bool {
+		for _, word := range words {
+			if ArrayContains(set, word) {
+				return true
+			}
+		}
+		return false
+	}
+
+	switch method {
+	case "GET", "HEAD":
+		return "read", "http_method"
+	case "DELETE":
+		return "destructive", "http_method"
+	case "POST":
+		if hasWord("search", "query", "filter", "list", "retrieve", "find", "lookup", "get") && !hasWord("create", "send", "add", "update", "delete", "remove") {
+			return "read", "name"
+		}
+		return "write", "http_method"
+	case "PUT", "PATCH", "CONNECT":
+		return "write", "http_method"
+	}
+
+	readOnly, destructive, _ := inferMCPActionBehavior(action)
+	if destructive {
+		return "destructive", "name"
+	}
+	if readOnly {
+		return "read", "name"
+	}
+	return "write", "name"
+}
+
+func catalogApprovalMode(safety string) string {
+	switch safety {
+	case "read":
+		return "allow"
+	case "destructive":
+		return "always_confirm"
+	}
+	return "confirm"
+}
+
+// Builds every action entry for one app. specBody is the app's stored OpenAPI spec, empty for non-OpenAPI apps.
+func buildAppActionCatalog(app WorkflowApp, specBody string) []CatalogActionEntry {
+	operations := parseCatalogSpec(specBody)
+	entries := []CatalogActionEntry{}
+	for _, action := range app.Actions {
+		if len(action.Name) == 0 || action.NodeType == "trigger" {
+			continue
+		}
+
+		entry := CatalogActionEntry{
+			AppID:              app.ID,
+			AppName:            app.Name,
+			AppVersion:         app.AppVersion,
+			Categories:         append(append([]string{}, app.Categories...), action.CategoryLabel...),
+			Action:             action.Name,
+			Label:              action.Label,
+			Summary:            catalogSummary(action.Description, action.Label),
+			Params:             []CatalogActionParam{},
+			BodyRequiredFields: action.RequiredBodyFields,
+		}
+
+		specParams := map[string]catalogSpecParam{}
+		operation := catalogMatchOperation(action, operations)
+		if operation != nil {
+			entry.Method = operation.Method
+			entry.Path = operation.Path
+			for _, param := range operation.Parameters {
+				if strings.EqualFold(param.In, "header") {
+					if catalogKey(param.Name) == "authorization" {
+						continue
+					}
+					example := catalogExampleString(param.Example)
+					value, needsValue := catalogResolveDefault(example)
+					if catalogSecretPattern.MatchString(value) {
+						value = ""
+					}
+					description := catalogTruncate(param.Description, 160)
+					if strings.Contains(strings.ToLower(description), "generated by shuffler.io") {
+						description = ""
+					}
+					entry.Headers = append(entry.Headers, CatalogActionParam{
+						Name:        param.Name,
+						In:          "header",
+						Required:    param.Required || len(value) > 0 || needsValue,
+						Description: description,
+						Default:     value,
+						NeedsValue:  needsValue,
+					})
+					continue
+				}
+				specParams[catalogKey(param.Name)] = param
+			}
+		}
+
+		for _, param := range action.Parameters {
+			if catalogHiddenParams[strings.ToLower(param.Name)] {
+				continue
+			}
+
+			entryParam := CatalogActionParam{
+				Name:        param.Name,
+				In:          "param",
+				Type:        param.Schema.Type,
+				Required:    param.Required,
+				Description: catalogTruncate(param.Description, 160),
+				Enum:        param.Options,
+			}
+			if specParam, ok := specParams[catalogKey(param.Name)]; ok {
+				entryParam.In = specParam.In
+				if len(specParam.Schema.Type) > 0 {
+					entryParam.Type = specParam.Schema.Type
+				}
+				for _, value := range specParam.Schema.Enum {
+					entryParam.Enum = append(entryParam.Enum, catalogExampleString(value))
+				}
+				if len(entryParam.Description) == 0 || strings.HasPrefix(entryParam.Description, "Generated by") {
+					entryParam.Description = catalogTruncate(specParam.Description, 160)
+				}
+			}
+			if strings.HasPrefix(entryParam.Description, "Generated by") {
+				entryParam.Description = ""
+			}
+
+			example := param.Example
+			if len(example) == 0 {
+				example = param.Value
+			}
+			if catalogSecretPattern.MatchString(example) {
+				example = ""
+			}
+			if strings.ToLower(param.Name) == "body" {
+				entryParam.In = "body"
+				entry.BodyExample = catalogTruncate(example, 800)
+			} else if value, needsValue := catalogResolveDefault(example); needsValue {
+				entryParam.NeedsValue = true
+			} else {
+				entryParam.Example = catalogTruncate(value, 160)
+			}
+
+			entry.Params = append(entry.Params, entryParam)
+		}
+
+		entry.Safety, entry.SafetySource = catalogSafety(app, action, entry.Method)
+		entry.ApprovalMode = catalogApprovalMode(entry.Safety)
+
+		searchParts := []string{action.Name, action.Label, entry.Summary, entry.Path, app.Name, strings.Join(entry.Categories, " ")}
+		for _, param := range entry.Params {
+			searchParts = append(searchParts, param.Name)
+		}
+		entry.SearchText = strings.Join(catalogTokens(strings.Join(searchParts, " ")), " ")
+
+		entries = append(entries, entry)
+	}
+
+	return entries
+}
+
+// Cached per app version. Reading the spec only happens on a cache miss.
+func getAppActionCatalog(ctx context.Context, app WorkflowApp) []CatalogActionEntry {
+	cacheKey := fmt.Sprintf("%s:%s:%d", app.ID, app.AppVersion, app.Edited)
+	actionCatalogCache.RLock()
+	cached, ok := actionCatalogCache.entries[cacheKey]
+	actionCatalogCache.RUnlock()
+	if ok {
+		return cached
+	}
+
+	specBody := ""
+	if app.Generated {
+		if spec, err := GetOpenApiDatastore(ctx, app.ID); err == nil {
+			specBody = spec.Body
+		}
+	}
+
+	entries := buildAppActionCatalog(app, specBody)
+	actionCatalogCache.Lock()
+	// ponytail: whole-cache reset at 2000 apps; switch to LRU if it ever churns
+	if len(actionCatalogCache.entries) > 2000 {
+		actionCatalogCache.entries = map[string][]CatalogActionEntry{}
+	}
+	actionCatalogCache.entries[cacheKey] = entries
+	actionCatalogCache.Unlock()
+	return entries
+}
+
+func findCatalogEntry(entries []CatalogActionEntry, action string) *CatalogActionEntry {
+	key := catalogKey(action)
+	for i := range entries {
+		if catalogKey(entries[i].Action) == key || catalogKey(entries[i].Label) == key {
+			return &entries[i]
+		}
+	}
+	return nil
+}
+
+// The "headers" parameter value for a call or a workflow node: spec headers with resolved defaults
+func catalogHeadersValue(entry *CatalogActionEntry) string {
+	lines := []string{}
+	for _, header := range entry.Headers {
+		if len(header.Default) > 0 {
+			lines = append(lines, fmt.Sprintf("%s=%s", header.Name, header.Default))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// Final "headers" value for a call. The generated app's header parser lets later lines win, so the order is:
+// the stored default, the spec's resolved defaults, the agent's headers text, then headers the agent set by name.
+func composeCatalogHeaders(entry *CatalogActionEntry, storedValue, agentText string, agentNamed map[string]string) string {
+	lines := []string{}
+	for _, part := range []string{storedValue, catalogHeadersValue(entry), agentText} {
+		if trimmed := strings.TrimSpace(part); len(trimmed) > 0 {
+			lines = append(lines, trimmed)
+		}
+	}
+	names := []string{}
+	for name := range agentNamed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		lines = append(lines, fmt.Sprintf("%s=%s", name, agentNamed[name]))
+	}
+	return strings.Join(lines, "\n")
+}
+
+// ---- Catalog search ----
+
+var catalogStopwords = map[string]bool{
+	"a": true, "an": true, "the": true, "to": true, "from": true, "of": true, "for": true, "in": true, "on": true,
+	"my": true, "with": true, "and": true, "or": true, "all": true, "into": true, "by": true, "at": true, "it": true,
+	"is": true, "be": true, "this": true, "that": true, "me": true, "our": true, "i": true, "want": true, "using": true,
+}
+
+var catalogSynonyms = map[string][]string{
+	"fetch": {"get", "list", "read"}, "read": {"get", "list"}, "find": {"search", "list", "get", "query"},
+	"show": {"get", "list"}, "email": {"message", "mail", "gmail"}, "mail": {"message", "email"},
+	"ticket": {"issue", "case", "incident"}, "issue": {"ticket"}, "row": {"value", "values", "append"},
+	"spreadsheet": {"sheet", "sheets"}, "sheet": {"spreadsheet", "values"}, "page": {"pages", "block"},
+	"add": {"create", "append", "insert", "post"}, "create": {"add", "post", "new"}, "remove": {"delete"},
+	"delete": {"remove"}, "update": {"edit", "patch", "modify"}, "send": {"post", "create"},
+	"channel": {"conversation", "conversations"}, "user": {"member", "users"}, "search": {"query", "find", "filter", "list"},
+	"query": {"search", "filter"}, "list": {"get", "search"}, "alert": {"alerts", "incident"},
+}
+
+var catalogReadVerbs = map[string]bool{"get": true, "list": true, "read": true, "fetch": true, "find": true, "search": true, "show": true, "lookup": true, "query": true, "retrieve": true, "view": true, "check": true}
+var catalogWriteVerbs = map[string]bool{"send": true, "create": true, "add": true, "append": true, "update": true, "post": true, "write": true, "delete": true, "remove": true, "insert": true, "set": true, "upload": true, "share": true, "invite": true, "edit": true}
+
+func catalogStem(word string) string {
+	if len(word) > 4 && strings.HasSuffix(word, "ies") {
+		return word[:len(word)-3] + "y"
+	}
+	if len(word) > 4 && strings.HasSuffix(word, "es") && (strings.HasSuffix(word, "sses") || strings.HasSuffix(word, "ches") || strings.HasSuffix(word, "shes") || strings.HasSuffix(word, "xes")) {
+		return word[:len(word)-2]
+	}
+	if len(word) > 3 && strings.HasSuffix(word, "s") && !strings.HasSuffix(word, "ss") {
+		return word[:len(word)-1]
+	}
+	return word
+}
+
+// Lowercases, splits on anything that isn't a letter or digit (and on camelCase), and stems
+func catalogTokens(text string) []string {
+	var b strings.Builder
+	runes := []rune(text)
+	for i, r := range runes {
+		if i > 0 && r >= 'A' && r <= 'Z' && runes[i-1] >= 'a' && runes[i-1] <= 'z' {
+			b.WriteRune(' ')
+		}
+		b.WriteRune(r)
+	}
+	tokens := []string{}
+	for _, field := range strings.FieldsFunc(strings.ToLower(b.String()), func(r rune) bool {
+		return !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'))
+	}) {
+		tokens = append(tokens, catalogStem(field))
+	}
+	return tokens
+}
+
+type CatalogSearchHit struct {
+	AppID    string   `json:"app_id"`
+	AppName  string   `json:"app"`
+	Action   string   `json:"action"`
+	Summary  string   `json:"summary"`
+	Safety   string   `json:"safety"`
+	Required []string `json:"required,omitempty"`
+	Ready    bool     `json:"ready"`
+	Score    float64  `json:"score,omitempty"`
+	entry    *CatalogActionEntry
+}
+
+// Ranks entries for a query: BM25 over weighted fields, entries matching every query term first (harp's
+// AND-then-OR tiers), rare terms outweighing common ones, plus small boosts for app name, intent and readiness.
+func rankCatalogEntries(entries []CatalogActionEntry, query string, ready map[string]bool, limit int) []CatalogSearchHit {
+	type doc struct {
+		entry  *CatalogActionEntry
+		tf     map[string]float64
+		length float64
+	}
+
+	fieldWeights := func(entry *CatalogActionEntry) map[string]float64 {
+		weights := map[string]float64{}
+		add := func(text string, weight float64) {
+			for _, token := range catalogTokens(text) {
+				weights[token] += weight
+			}
+		}
+		// The HTTP method prefix of generated names (post_search) is noise once the method is known
+		name := entry.Action
+		if len(entry.Method) > 0 && strings.HasPrefix(strings.ToLower(name), strings.ToLower(entry.Method)+"_") {
+			name = name[len(entry.Method)+1:]
+		}
+		add(name+" "+entry.Label, 3)
+		add(entry.Summary, 2)
+		add(entry.Path, 1.5)
+		add(entry.AppName+" "+strings.Join(entry.Categories, " "), 1.5)
+		for _, param := range entry.Params {
+			add(param.Name, 1)
+		}
+		return weights
+	}
+
+	docs := []doc{}
+	totalLength := 0.0
+	appTokens := map[string]map[string]bool{}
+	for i := range entries {
+		tf := fieldWeights(&entries[i])
+		length := 0.0
+		for _, weight := range tf {
+			length += weight
+		}
+		docs = append(docs, doc{entry: &entries[i], tf: tf, length: length})
+		totalLength += length
+		if _, ok := appTokens[entries[i].AppID]; !ok {
+			appTokens[entries[i].AppID] = map[string]bool{}
+			for _, token := range catalogTokens(entries[i].AppName) {
+				appTokens[entries[i].AppID][token] = true
+			}
+		}
+	}
+	if len(docs) == 0 {
+		return []CatalogSearchHit{}
+	}
+	averageLength := totalLength / float64(len(docs))
+
+	queryTerms := []string{}
+	for _, token := range catalogTokens(query) {
+		if !catalogStopwords[token] && !ArrayContains(queryTerms, token) {
+			queryTerms = append(queryTerms, token)
+		}
+	}
+
+	wantsRead, wantsWrite := false, false
+	for _, term := range queryTerms {
+		wantsRead = wantsRead || catalogReadVerbs[term]
+		wantsWrite = wantsWrite || catalogWriteVerbs[term]
+	}
+
+	frequencies := map[string]int{}
+	documentFrequency := func(term string) int {
+		if count, ok := frequencies[term]; ok {
+			return count
+		}
+		count := 0
+		for _, d := range docs {
+			if d.tf[term] > 0 {
+				count++
+			}
+		}
+		frequencies[term] = count
+		return count
+	}
+
+	const k1, b = 1.2, 0.75
+	type scored struct {
+		doc     doc
+		matched int
+		score   float64
+	}
+	results := []scored{}
+	for _, d := range docs {
+		matched := 0
+		score := 0.0
+		for _, term := range queryTerms {
+			if appTokens[d.entry.AppID][term] {
+				matched++
+				score += 1.5
+				continue
+			}
+
+			alternatives := append([]string{term}, catalogSynonyms[term]...)
+			best := 0.0
+			for altIndex, alternative := range alternatives {
+				alternative = catalogStem(alternative)
+				tf := d.tf[alternative]
+				if tf == 0 {
+					continue
+				}
+				n := float64(documentFrequency(alternative))
+				idf := math.Log(1 + (float64(len(docs))-n+0.5)/(n+0.5))
+				termScore := idf * (tf * (k1 + 1)) / (tf + k1*(1-b+b*d.length/averageLength))
+				if altIndex > 0 {
+					termScore *= 0.6
+				}
+				if termScore > best {
+					best = termScore
+				}
+			}
+			if best > 0 {
+				matched++
+				score += best
+			}
+		}
+
+		if len(queryTerms) > 0 && matched == 0 {
+			continue
+		}
+		if wantsRead && !wantsWrite && d.entry.Safety == "read" {
+			score *= 1.2
+		} else if wantsWrite && d.entry.Safety != "read" {
+			score *= 1.2
+		}
+		if ready[d.entry.AppID] {
+			score *= 1.1
+		}
+		if catalogKey(d.entry.Action) == "customaction" {
+			score *= 0.5
+		}
+		if catalogKey(d.entry.Action) == catalogKey(query) {
+			score += 100
+		}
+		results = append(results, scored{doc: d, matched: matched, score: score})
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].matched != results[j].matched {
+			return results[i].matched > results[j].matched
+		}
+		return results[i].score > results[j].score
+	})
+
+	if limit <= 0 {
+		limit = 8
+	} else if limit > 10 {
+		limit = 10
+	}
+	hits := []CatalogSearchHit{}
+	for _, result := range results {
+		if len(hits) >= limit {
+			break
+		}
+		entry := result.doc.entry
+		required := []string{}
+		for _, param := range entry.Params {
+			if param.Required {
+				required = append(required, param.Name)
+			}
+		}
+		hits = append(hits, CatalogSearchHit{
+			AppID:    entry.AppID,
+			AppName:  entry.AppName,
+			Action:   entry.Action,
+			Summary:  entry.Summary,
+			Safety:   entry.Safety,
+			Required: required,
+			Ready:    ready[entry.AppID],
+			Score:    math.Round(result.score*100) / 100,
+			entry:    entry,
+		})
+	}
+	return hits
+}
+
+type CatalogHitApp struct {
+	AppName     string `json:"app"`
+	AppID       string `json:"app_id"`
+	Description string `json:"description,omitempty"`
+	Ready       bool   `json:"ready"`
+	ConnectURL  string `json:"connect_url,omitempty"`
+}
+
+// One row per app in the hits, in hit order, so each app's description is sent once instead of per action
+func catalogHitApps(hits []CatalogSearchHit, apps []WorkflowApp) []CatalogHitApp {
+	descriptions := map[string]string{}
+	for _, app := range apps {
+		descriptions[app.ID] = catalogSummary(catalogGeneratedPattern.ReplaceAllString(app.Description, ""), "")
+	}
+
+	rows := []CatalogHitApp{}
+	seen := map[string]bool{}
+	for _, hit := range hits {
+		if seen[hit.AppID] {
+			continue
+		}
+		seen[hit.AppID] = true
+		row := CatalogHitApp{AppName: hit.AppName, AppID: hit.AppID, Description: descriptions[hit.AppID], Ready: hit.Ready}
+		if !hit.Ready {
+			row.ConnectURL = fmt.Sprintf("/apps/%s", hit.AppID)
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// Apps an agent can't use as tools: the builder's own apps
+func isCatalogInternalApp(app WorkflowApp) bool {
+	return ArrayContains([]string{workflowBuilderAppId, shuffleAppsAppId, "9f05339c05f9aaca4eeb35e6f13e41e6"}, app.ID) || len(app.Actions) == 0
+}
+
+// Per org: whether each app can be called now (authenticated, or needs no auth)
+func getCatalogReadiness(ctx context.Context, orgId string, apps []WorkflowApp) map[string]bool {
+	orgAuths, err := GetAllWorkflowAppAuth(ctx, orgId)
+	if err != nil {
+		log.Printf("[WARNING] Catalog: failed loading auths for org %s: %s", orgId, err)
+	}
+
+	ready := map[string]bool{}
+	for _, app := range apps {
+		ready[app.ID] = !app.Authentication.Required
+		for _, auth := range orgAuths {
+			if auth.App.ID == app.ID || strings.EqualFold(auth.App.Name, app.Name) {
+				ready[app.ID] = true
+				break
+			}
+		}
+	}
+	return ready
+}
+
+// Candidate apps for a search: one named app, or the org's apps plus the best public match for the query
+func getCatalogCandidateApps(ctx context.Context, user User, query, appFilter string) []WorkflowApp {
+	allApps, err := GetPrioritizedApps(ctx, user)
+	if err != nil {
+		log.Printf("[WARNING] Catalog: failed getting apps for %s: %s", user.Username, err)
+	}
+
+	candidates := []WorkflowApp{}
+	if len(strings.TrimSpace(appFilter)) > 0 {
+		candidates = resolveAgentApps(ctx, user, allApps, []string{appFilter}, []string{appFilter})
+	} else {
+		candidates = append(candidates, allApps...)
+		if algoliaApp, err := HandleAlgoliaAppSearch(ctx, query); err == nil && len(algoliaApp.ObjectID) > 0 {
+			candidates = append(candidates, resolveAgentApps(ctx, user, allApps, nil, []string{algoliaApp.ObjectID})...)
+		}
+	}
+
+	seen := map[string]bool{}
+	apps := []WorkflowApp{}
+	for _, app := range candidates {
+		if seen[app.ID] || isCatalogInternalApp(app) {
+			continue
+		}
+		seen[app.ID] = true
+		apps = append(apps, app)
+		if len(apps) >= 25 {
+			break
+		}
+	}
+	return apps
+}
+
+// GET /api/v1/apps/actions/search?query=&app=&limit=&debug=
+func HandleSearchAppActions(resp http.ResponseWriter, request *http.Request) {
+	cors := HandleCors(resp, request)
+	if cors {
+		return
+	}
+
+	user, err := HandleApiAuthentication(resp, request)
+	if err != nil {
+		resp.WriteHeader(401)
+		resp.Write([]byte(`{"success": false, "reason": "Authentication failed"}`))
+		return
+	}
+
+	ctx := GetContext(request)
+	params := request.URL.Query()
+	query := strings.TrimSpace(params.Get("query"))
+	appFilter := strings.TrimSpace(params.Get("app"))
+	if len(query) == 0 && len(appFilter) == 0 {
+		resp.WriteHeader(400)
+		resp.Write([]byte(`{"success": false, "reason": "Provide query (what the action should do), and optionally app"}`))
+		return
+	}
+	limit, _ := strconv.Atoi(params.Get("limit"))
+
+	apps := getCatalogCandidateApps(ctx, user, query, appFilter)
+	if len(apps) == 0 {
+		resp.WriteHeader(404)
+		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No app found for '%s'. Try another app name or describe the action instead."}`, catalogTruncate(appFilter+" "+query, 100))))
+		return
+	}
+
+	entries := []CatalogActionEntry{}
+	for _, app := range apps {
+		entries = append(entries, getAppActionCatalog(ctx, app)...)
+	}
+	ready := getCatalogReadiness(ctx, user.ActiveOrg.Id, apps)
+	hits := rankCatalogEntries(entries, query, ready, limit)
+
+	if params.Get("debug") != "true" {
+		for i := range hits {
+			hits[i].Score = 0
+		}
+	}
+
+	responseBody := map[string]interface{}{
+		"success":       true,
+		"query":         query,
+		"results":       hits,
+		"apps":          catalogHitApps(hits, apps),
+		"apps_searched": len(apps),
+		"next":          "Pick by the app and action descriptions, then call get_action with the app and action you will use, before calling it or adding it as a node.",
+	}
+	if len(hits) == 0 {
+		responseBody["next"] = "Nothing matched. Rephrase the query with the app's own words (e.g. 'list messages' instead of 'fetch emails'), or pass app to search one app."
+	}
+
+	marshalled, _ := json.Marshal(responseBody)
+	resp.WriteHeader(200)
+	resp.Write(marshalled)
+}
+
+// GET /api/v1/apps/{app}/actions/{action}: one action's full entry. app is an ID or a name.
+// GET /api/v1/agent/skills/{name}/resources?path=references/<file>.md
+// Serves one file an agent skill ships, so the agent loads detail only when it needs it
+func HandleGetAgentSkillResource(resp http.ResponseWriter, request *http.Request) {
+	cors := HandleCors(resp, request)
+	if cors {
+		return
+	}
+
+	if _, err := HandleApiAuthentication(resp, request); err != nil {
+		resp.WriteHeader(401)
+		resp.Write([]byte(`{"success": false, "reason": "Authentication failed"}`))
+		return
+	}
+
+	location := strings.Split(strings.Split(request.URL.Path, "?")[0], "/")
+	if len(location) < 7 || location[4] != "skills" || location[6] != "resources" {
+		resp.WriteHeader(400)
+		resp.Write([]byte(`{"success": false, "reason": "Use /api/v1/agent/skills/{name}/resources?path=references/<file>.md"}`))
+		return
+	}
+
+	name, _ := neturl.PathUnescape(location[5])
+	resourcePath := request.URL.Query().Get("path")
+	content, err := readAgentSkillResource(name, resourcePath)
+	if err != nil {
+		data, _ := json.Marshal(map[string]interface{}{"success": false, "reason": err.Error()})
+		resp.WriteHeader(404)
+		resp.Write(data)
+		return
+	}
+
+	data, _ := json.Marshal(map[string]interface{}{
+		"success": true,
+		"skill":   name,
+		"path":    resourcePath,
+		"content": content,
+		"next":    "Follow this together with your instructions. Don't load the same file again in this session.",
+	})
+	resp.WriteHeader(200)
+	resp.Write(data)
+}
+
+func HandleGetAppAction(resp http.ResponseWriter, request *http.Request) {
+	cors := HandleCors(resp, request)
+	if cors {
+		return
+	}
+
+	user, err := HandleApiAuthentication(resp, request)
+	if err != nil {
+		resp.WriteHeader(401)
+		resp.Write([]byte(`{"success": false, "reason": "Authentication failed"}`))
+		return
+	}
+
+	location := strings.Split(strings.Split(request.URL.Path, "?")[0], "/")
+	if len(location) < 7 || location[5] != "actions" {
+		resp.WriteHeader(400)
+		resp.Write([]byte(`{"success": false, "reason": "Use /api/v1/apps/{app}/actions/{action}"}`))
+		return
+	}
+	appRef, _ := neturl.PathUnescape(location[4])
+	actionName, _ := neturl.PathUnescape(location[6])
+
+	ctx := GetContext(request)
+	allApps, _ := GetPrioritizedApps(ctx, user)
+	apps := resolveAgentApps(ctx, user, allApps, []string{appRef}, []string{appRef})
+	if len(apps) == 0 {
+		resp.WriteHeader(404)
+		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "App '%s' not found. Use search_actions to find it."}`, catalogTruncate(appRef, 80))))
+		return
+	}
+
+	app := apps[0]
+	entries := getAppActionCatalog(ctx, app)
+	entry := findCatalogEntry(entries, actionName)
+	if entry == nil {
+		names := []string{}
+		for _, candidate := range rankCatalogEntries(entries, actionName, nil, 5) {
+			names = append(names, candidate.Action)
+		}
+		marshalled, _ := json.Marshal(map[string]interface{}{
+			"success": false,
+			"reason":  fmt.Sprintf("Action '%s' not found in %s", catalogTruncate(actionName, 80), app.Name),
+			"closest": names,
+		})
+		resp.WriteHeader(404)
+		resp.Write(marshalled)
+		return
+	}
+
+	ready := getCatalogReadiness(ctx, user.ActiveOrg.Id, []WorkflowApp{app})[app.ID]
+	shownEntry := *entry
+	if request.URL.Query().Get("debug") != "true" {
+		shownEntry.SearchText = ""
+	}
+	output := map[string]interface{}{
+		"success": true,
+		"entry":   shownEntry,
+		"ready":   ready,
+	}
+	if !ready {
+		output["connect_url"] = fmt.Sprintf("/apps/%s", app.ID)
+	}
+	if headersValue := catalogHeadersValue(entry); len(headersValue) > 0 {
+		output["headers_value"] = headersValue
+		output["headers_note"] = "When you add this action as a workflow node, set its 'headers' parameter to headers_value. Agent calls send these headers automatically; pass a header by name to override it."
+	}
+
+	marshalled, _ := json.Marshal(output)
+	resp.WriteHeader(200)
+	resp.Write(marshalled)
 }
 
 func agentWorkflowSeenKey(workflowID string) string {
@@ -40022,6 +41033,17 @@ func getWorkflowBuilderRequest(execution WorkflowExecution, decision AgentDecisi
 		return workflowBuilderRequest{}, false
 	}
 
+	if isRetiredBuilderAction(decision.Action) {
+		return workflowBuilderRequest{
+			Method: "GET",
+			Path:   "/api/v1/apps/actions/search",
+			Handler: func(resp http.ResponseWriter, request *http.Request) {
+				resp.WriteHeader(410)
+				resp.Write([]byte(`{"success": false, "reason": "This lookup was removed. Use search_actions with what the action should do (e.g. query 'list email messages'), then get_action on the one you pick."}`))
+			},
+		}, true
+	}
+
 	fields := map[string]string{}
 	for _, field := range decision.Fields {
 		value := field.Value
@@ -40060,13 +41082,22 @@ func getWorkflowBuilderRequest(execution WorkflowExecution, decision AgentDecisi
 	return workflowBuilderRequest{}, false
 }
 
+// An exact action name wins. Without one, the name minus its method also matches (search_actions for
+// get_search_actions), since the model often drops the prefix the spec gives an action.
 func findInternalAppRequest(swagger *openapi3.Swagger, action string, fields map[string]string) (builderRequest workflowBuilderRequest, found bool, ok bool) {
-	for path, item := range swagger.Paths {
-		for method, operation := range item.Operations() {
-			if normalizeToolName(specActionName(method, operation.Summary)) == action {
-				builderRequest, ok = buildInternalAppRequest(path, method, operation, fields)
-				builderRequest.Resource = getAgentResourceSpec(operation)
-				return builderRequest, true, ok
+	for _, withoutMethod := range []bool{false, true} {
+		for path, item := range swagger.Paths {
+			for method, operation := range item.Operations() {
+				name := specActionName(method, operation.Summary)
+				if withoutMethod {
+					name = strings.TrimPrefix(name, strings.ToLower(method)+"_")
+				}
+
+				if normalizeToolName(name) == action {
+					builderRequest, ok = buildInternalAppRequest(path, method, operation, fields)
+					builderRequest.Resource = getAgentResourceSpec(operation)
+					return builderRequest, true, ok
+				}
 			}
 		}
 	}
@@ -40089,6 +41120,11 @@ func buildInternalAppRequest(path, method string, operation *openapi3.Operation,
 			value = strings.TrimSpace(fields[normalizeToolName(ValidateParameterName(param.Name))])
 		}
 
+		if len(value) == 0 && param.In != "body" {
+			// The model sometimes sends every field inside a JSON "body" instead
+			value = firstCatalogField(fields, param.Name)
+		}
+
 		if len(value) == 0 && param.Required && param.Example != nil {
 			value = fmt.Sprintf("%v", param.Example)
 		}
@@ -40108,9 +41144,6 @@ func buildInternalAppRequest(path, method string, operation *openapi3.Operation,
 	}
 
 	body := fields["body"]
-	if len(body) == 0 {
-		body = getAppLookupBody(fields)
-	}
 
 	if len(query) > 0 {
 		path = fmt.Sprintf("%s?%s", path, query.Encode())
@@ -40123,33 +41156,32 @@ func buildInternalAppRequest(path, method string, operation *openapi3.Operation,
 	}, true
 }
 
-// The model sometimes sends app_names as its own field instead of inside body
-func getAppLookupBody(fields map[string]string) string {
-	lookup := map[string][]string{}
-	for key, field := range map[string]string{"appnames": "app_names", "appname": "app_names", "name": "app_names", "appids": "app_ids", "appid": "app_ids"} {
-		value := strings.TrimSpace(fields[key])
-		if len(value) == 0 {
-			continue
-		}
-
-		values := []string{}
-		if json.Unmarshal([]byte(value), &values) != nil {
-			values = strings.Split(value, ",")
-		}
-
-		for _, item := range values {
-			if item = strings.TrimSpace(item); len(item) > 0 {
-				lookup[field] = append(lookup[field], item)
+// First non-empty field among the given names (normalized like the builder fields). Also reads
+// them from a JSON "body" field, which the model sometimes sends instead of separate fields.
+func firstCatalogField(fields map[string]string, names ...string) string {
+	bodyFields := map[string]interface{}{}
+	if body := strings.TrimSpace(fields["body"]); strings.HasPrefix(body, "{") {
+		json.Unmarshal([]byte(body), &bodyFields)
+	}
+	for _, name := range names {
+		for key, value := range bodyFields {
+			if normalizeToolName(key) == normalizeToolName(name) {
+				if text := strings.TrimSpace(fmt.Sprintf("%v", value)); len(text) > 0 && name != "body" {
+					return text
+				}
 			}
 		}
 	}
 
-	if len(lookup) == 0 {
-		return ""
+	for _, name := range names {
+		if name == "body" && len(bodyFields) > 0 {
+			continue
+		}
+		if value := strings.TrimSpace(fields[normalizeToolName(name)]); len(value) > 0 {
+			return value
+		}
 	}
-
-	body, _ := json.Marshal(lookup)
-	return string(body)
+	return ""
 }
 
 // Wraps the handler response in the same shape the builder app returns, so the agent reads it the same way
@@ -40432,6 +41464,9 @@ func runWorkflowBuilderDecisionInProcess(execution WorkflowExecution, decision A
 	return result, "", builderRequest.AppName, []string{}, decision.Action, nil
 }
 
+// How long the agent's unsaved edits are kept
+const agentWorkflowDraftMinutes = 24 * 60
+
 func HandleAgentWorkflowOperations(resp http.ResponseWriter, request *http.Request) {
 	cors := HandleCors(resp, request)
 	if cors {
@@ -40617,7 +41652,8 @@ func HandleAgentWorkflowOperations(resp http.ResponseWriter, request *http.Reque
 		return
 	}
 
-	cacheErr = SetCache(ctx, cacheKey, workflowBytes, 30)
+	// The draft outlives approvals the user leaves waiting (a 30 minute draft lost whole builds)
+	cacheErr = SetCache(ctx, cacheKey, workflowBytes, agentWorkflowDraftMinutes)
 	if cacheErr != nil {
 		log.Printf("[WARNING] Failed caching workflow: %s", cacheErr)
 		// Don't fail the request, cache is best-effort
@@ -40812,7 +41848,7 @@ func HandleAgentWorkflowOperations(resp http.ResponseWriter, request *http.Reque
 		OperationsApplied: len(setOpsReq.Operations),
 		Workflow:          minWf,
 		IDMapping:         tempIDMap, // Include temp_id → real_id mappings
-		CacheExpiresIn:    1800,
+		CacheExpiresIn:    agentWorkflowDraftMinutes * 60,
 		Validation:        validateWorkflowForAgent(ctx, workflow, agentLatestRun(ctx, workflowID)),
 	}
 
@@ -42253,13 +43289,10 @@ func workflowToolHandler(run func(tc agentToolContext, fields map[string]string)
 }
 
 
+// Template aliases live in skills/workflow-builder/SKILL.md (metadata.templates)
 func isWorkflowBuilderTemplate(template string) bool {
-	switch strings.ToLower(strings.TrimSpace(template)) {
-	case "workflow-edit", "edit-workflow", "build-workflows", "workflow-builder":
-		return true
-	}
-
-	return false
+	skill, ok := agentSkillForTemplate(template)
+	return ok && skill.Name == "workflow-builder"
 }
 
 func getAgentNodeParam(execution WorkflowExecution, name string) string {
@@ -43343,7 +44376,7 @@ func runAgentGetWorkflowRun(tc agentToolContext, fields map[string]string) map[s
 			entry["error_kind"] = outcome.ErrorKind
 			if outcome.ErrorKind == "auth" {
 				entry["hint"] = "This is the workflow node's credentials failing, not your own tool call. Editing the node's parameters won't fix it."
-				entry["next"] = agentToolNext("Get the app's setup_url and ask the user to authenticate it again.", agentToolCall(agentToolAppsName, "post_get_app_actions_summary", "body", fmt.Sprintf(`{"app_names": [%q]}`, outcome.Action.AppName)))
+				entry["next"] = agentToolNext("Get the app's connect_url and ask the user to authenticate it again.", agentToolCall(agentToolBuilderName, "get_action", "app", outcome.Action.AppName, "action", outcome.Action.Name))
 			}
 		}
 
@@ -43384,7 +44417,7 @@ func runAgentGetWorkflowRun(tc agentToolContext, fields map[string]string) map[s
 	case len(summary.Failed) > 0 && focus == nil:
 		failed := summary.Failed[0]
 		if failed.ErrorKind == "auth" {
-			result["next"] = agentToolNext("The failure is a credentials problem. Ask the user to authenticate the app again.", agentToolCall(agentToolAppsName, "post_get_app_actions_summary", "body", fmt.Sprintf(`{"app_names": [%q]}`, failed.Action.AppName)))
+			result["next"] = agentToolNext("The failure is a credentials problem. Ask the user to authenticate the app again.", agentToolCall(agentToolBuilderName, "get_action", "app", failed.Action.AppName, "action", failed.Action.Name))
 		} else {
 			result["next"] = agentToolNext("See the failing node's full parameters and result before fixing it.", agentToolCall(agentToolBuilderName, "get_workflow_run", "execution_id", run.ExecutionId, "node", failed.Action.Label))
 		}
@@ -44166,12 +45199,12 @@ func validateWorkflowForAgent(ctx context.Context, workflow *Workflow, latestRun
 			}
 
 			if secret := agentFindSecret(param.Value); len(secret) > 0 {
-				add("warning", action.Label, "hardcoded_secret", fmt.Sprintf("Parameter '%s' contains what looks like a %s. Anyone who can open the workflow can read it, and it stops working once it expires.", param.Name, secret), "Clear it and use the app's saved credentials. post_get_app_actions_summary returns a setup_url if the app isn't authenticated.")
+				add("warning", action.Label, "hardcoded_secret", fmt.Sprintf("Parameter '%s' contains what looks like a %s. Anyone who can open the workflow can read it, and it stops working once it expires.", param.Name, secret), "Clear it and use the app's saved credentials. get_action returns a connect_url if the app isn't authenticated.")
 			}
 		}
 
 		if hasCredentialParams && !credentialsFilled && len(action.AuthenticationId) == 0 {
-			add("warning", action.Label, "needs_credentials", fmt.Sprintf("%s has no credentials attached.", action.AppName), fmt.Sprintf("Call post_get_app_actions_summary for %s to get its setup_url, and ask the user to authenticate.", action.AppName))
+			add("warning", action.Label, "needs_credentials", fmt.Sprintf("%s has no credentials attached.", action.AppName), fmt.Sprintf("Call get_action for %s (action %s) to get its connect_url, and ask the user to authenticate.", action.AppName, action.Name))
 		}
 
 		for _, ref := range describeAgentRefs(action.Parameters, workflow, latestRun) {
